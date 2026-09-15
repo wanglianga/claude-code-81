@@ -859,68 +859,134 @@ export class BusinessService {
     return p;
   }
 
+  // 计算提案涉线企业：关联线路的共线企业；园区级提案（无线路）视为全部企业
+  private async involvedCompanyIds(manager: DataSource | any, p: LineProposal): Promise<number[]> {
+    if (p.lineId) {
+      const line = await manager.getRepository(Line).findOne({
+        where: { id: p.lineId }, relations: { companies: true },
+      });
+      if (!line) throw new NotFoundException('提案关联线路不存在');
+      return line.companies.map(c => c.id);
+    }
+    const all = await manager.getRepository(Company).find({ select: { id: true } });
+    return all.map(c => c.id);
+  }
+
+  // 以当前持久化确认集合重新计算完整双确认矩阵：
+  // 每家涉线企业 HR 均确认 且 每家涉线企业配置的员工代表均确认
+  private matrixComplete(p: LineProposal, companyIds: number[]) {
+    const cc = p.companyConfirmations || [];
+    const ec = p.employeeConfirmations || [];
+    const companiesDone = companyIds.every(cid => cc.some((c: any) => c.companyId === cid && c.confirmed));
+    const employeesDone = companyIds.every(cid => ec.some((c: any) => c.companyId === cid && c.confirmed));
+    return { companiesDone, employeesDone, complete: companiesDone && employeesDone };
+  }
+
   async confirmProposal(id: number, side: 'company' | 'employee', user: any, note?: string) {
-    const p = await this.proposals.findOne({ where: { id } });
-    if (!p) throw new NotFoundException('提案不存在');
-    if (['confirmed', 'rejected', 'cancelled'].includes(p.status))
-      throw new BadRequestException('提案已闭环');
-    const line = p.lineId ? await this.lines.findOne({ where: { id: p.lineId }, relations: { companies: true } }) : null;
-    const companyName = user.companyId
-      ? (await this.companies.findOne({ where: { id: user.companyId } }))?.name
-      : '园区级';
-    const lineCompanyIds = (line?.companies || []).map((c: Company) => c.id);
-    const needCompanies = lineCompanyIds.length || 1;
+    return this.ds.transaction(async (manager) => {
+      const p = await manager.getRepository(LineProposal).findOne({ where: { id } });
+      if (!p) throw new NotFoundException('提案不存在');
+      if (['confirmed', 'rejected', 'cancelled'].includes(p.status))
+        throw new BadRequestException('提案已闭环，不可再确认');
 
-    if (side === 'company') {
-      if (user.role !== 'hr') throw new ForbiddenException('仅企业负责人(HR)可代表企业确认');
-      const arr = p.companyConfirmations || [];
-      if (arr.find((c: any) => c.companyId === user.companyId))
-        throw new BadRequestException('贵企业已确认');
-      arr.push({ companyId: user.companyId, name: companyName, confirmed: true, by: user.realName, at: new Date().toISOString(), note });
-      p.companyConfirmations = arr;
-    } else {
-      if (user.role !== 'employee') throw new ForbiddenException('仅员工代表可代表员工确认');
-      const arr = p.employeeConfirmations || [];
-      if (arr.find((c: any) => c.by === user.realName)) throw new BadRequestException('您已确认');
-      arr.push({ name: companyName, confirmed: true, by: user.realName, at: new Date().toISOString(), note });
-      p.employeeConfirmations = arr;
-    }
+      const companyIds = await this.involvedCompanyIds(manager, p);
+      if (!companyIds.length) throw new BadRequestException('提案没有涉线企业，无法确认');
+      const now = new Date().toISOString();
 
-    // 双方可并行确认：涉及企业全部确认 + 至少一名员工代表确认 → 双确认通过
-    const companiesDone = lineCompanyIds.length
-      ? lineCompanyIds.every((cid: number) => (p.companyConfirmations || []).some((c: any) => c.companyId === cid))
-      : (p.companyConfirmations || []).length >= 1;
-    const employeesDone = (p.employeeConfirmations || []).length >= 1;
-    if (companiesDone && employeesDone) p.status = 'employee_confirmed';
-    else if (companiesDone) p.status = 'company_confirmed';
+      if (side === 'company') {
+        if (user.role !== 'hr') throw new ForbiddenException('仅涉线企业 HR 可代表企业确认');
+        if (!user.companyId || !companyIds.includes(Number(user.companyId)))
+          throw new ForbiddenException('贵企业不在该提案关联线路的共线企业范围内，无权确认');
+        const arr = p.companyConfirmations || [];
+        if (arr.find((c: any) => c.companyId === Number(user.companyId)))
+          throw new BadRequestException('贵企业已完成确认，请勿重复确认');
+        const company = await manager.getRepository(Company).findOne({ where: { id: Number(user.companyId) } });
+        arr.push({ companyId: company.id, name: company.name, confirmed: true, by: user.realName, at: now, note: note || '' });
+        p.companyConfirmations = arr;
+      } else {
+        if (user.role !== 'employee')
+          throw new ForbiddenException('仅企业配置的员工代表可代表员工确认');
+        // 必须是某家涉线企业配置的 representative（同企业 + 姓名一致），普通员工无权
+        if (!user.companyId || !companyIds.includes(Number(user.companyId)))
+          throw new ForbiddenException('您所在企业不在提案涉线范围内');
+        const myCompany = await manager.getRepository(Company).findOne({ where: { id: Number(user.companyId) } });
+        const isRep = !!myCompany?.representative
+          && myCompany.representative.trim() === (user.realName || '').trim();
+        if (!isRep)
+          throw new ForbiddenException('您不是本企业配置的员工代表，无权代表员工确认');
+        const arr = p.employeeConfirmations || [];
+        if (arr.find((c: any) => c.companyId === myCompany.id))
+          throw new BadRequestException('贵企业员工代表已完成确认，请勿重复确认');
+        arr.push({ companyId: myCompany.id, name: myCompany.name, confirmed: true, by: user.realName, at: now, note: note || '' });
+        p.employeeConfirmations = arr;
+      }
 
-    await this.proposals.save(p);
-    if (p.status === 'employee_confirmed') {
-      await this.notifyRoles(['operator', 'dispatcher'], '线路提案双确认通过',
-        `《${p.title}》已获 ${needCompanies} 家企业负责人与员工代表共同确认，可发布执行。`);
-    }
-    return p;
+      // 事务内以持久化确认集合重算状态
+      const m = this.matrixComplete(p, companyIds);
+      p.status = m.complete ? 'employee_confirmed' : m.companiesDone ? 'company_confirmed' : 'proposed';
+      await manager.getRepository(LineProposal).save(p);
+
+      if (m.complete) {
+        const targets = await manager.getRepository(User).find({
+          where: [{ role: 'operator', active: true }, { role: 'dispatcher', active: true }],
+        });
+        for (const u of targets) {
+          await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
+            userId: u.id, title: '线路提案双确认通过',
+            content: `《${p.title}》涉线 ${companyIds.length} 家企业 HR 与员工代表均已确认，可发布执行。`,
+          }));
+        }
+      }
+      return p;
+    });
   }
 
   async applyProposal(id: number, user: any) {
     if (user.role !== 'operator') throw new ForbiddenException('仅园区运营可发布执行');
-    const p = await this.proposals.findOne({ where: { id } });
-    if (!p) throw new NotFoundException('提案不存在');
-    if (p.status !== 'employee_confirmed' && p.status !== 'company_confirmed')
-      throw new BadRequestException('需企业与员工双方确认后方可执行');
-    p.status = 'confirmed';
-    await this.proposals.save(p);
-    // 落地：停运 / 搬迁类调整更新线路状态
-    if (p.lineId && ['suspend', 'relocation'].includes(p.type)) {
-      const line = await this.lines.findOne({ where: { id: p.lineId } });
-      if (line) {
-        line.status = p.type === 'suspend' ? 'suspended' : 'relocated';
-        await this.lines.save(line);
+    return this.ds.transaction(async (manager) => {
+      const p = await manager.getRepository(LineProposal).findOne({ where: { id } });
+      if (!p) throw new NotFoundException('提案不存在');
+      if (p.status === 'confirmed')
+        throw new BadRequestException('提案已发布，请勿重复操作（影响不重复落地）');
+      if (['rejected', 'cancelled'].includes(p.status))
+        throw new BadRequestException('提案已驳回/取消，不可发布');
+
+      // 仅接受完整双确认，并用持久化确认集合复核，任一企业 HR 或员工代表缺失即拒绝
+      const companyIds = await this.involvedCompanyIds(manager, p);
+      const m = this.matrixComplete(p, companyIds);
+      if (p.status !== 'employee_confirmed' || !m.complete) {
+        const missingHr = companyIds.filter(cid => !(p.companyConfirmations || []).some((c: any) => c.companyId === cid && c.confirmed));
+        const missingRep = companyIds.filter(cid => !(p.employeeConfirmations || []).some((c: any) => c.companyId === cid && c.confirmed));
+        throw new BadRequestException(
+          `双确认不完整，禁止发布（缺 HR 企业 ${missingHr.length} 家、缺员工代表企业 ${missingRep.length} 家）。提案状态与线路均未变更。`,
+        );
       }
-    }
-    await this.notifyRoles(['hr', 'dispatcher'], '线路调整已执行',
-      `《${p.title}》已于 ${p.effectiveDate || '今日'} 生效：${(p.impactSummary || '').slice(0, 60)}`);
-    return p;
+
+      // 以下影响在事务内只落地一次
+      p.status = 'confirmed';
+      await manager.getRepository(LineProposal).save(p);
+
+      let line: Line | null = null;
+      if (p.lineId && ['suspend', 'relocation'].includes(p.type)) {
+        line = await manager.getRepository(Line).findOne({ where: { id: p.lineId } });
+        if (line) {
+          line.status = p.type === 'suspend' ? 'suspended' : 'relocated';
+          await manager.getRepository(Line).save(line);
+        }
+      }
+
+      // 车辆/司机/企业费用影响随提案归档（estimatedSaving/impactSummary 在创建时已持久化，此处仅发布一次）
+      const targets = await manager.getRepository(User).find({
+        where: [{ role: 'hr', active: true }, { role: 'dispatcher', active: true }],
+      });
+      for (const u of targets) {
+        await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
+          userId: u.id, title: '线路调整已执行',
+          content: `《${p.title}》已于 ${p.effectiveDate || '今日'} 生效：${(p.impactSummary || '').slice(0, 60)}。请同步车辆、司机排班与企业费用。`,
+        }));
+      }
+      return p;
+    });
   }
 
   async rejectProposal(id: number, user: any, note?: string) {

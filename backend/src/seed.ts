@@ -38,11 +38,11 @@ async function main() {
   }));
   const c2 = await ds.getRepository(E.Company).save(ds.getRepository(E.Company).create({
     name: '瑞丰精密制造', code: 'RF', lateGraceMinutes: 5, dayShiftStart: '08:00',
-    nightShiftStart: '20:00', lateFeeBase: 30, representative: '王敏',
+    nightShiftStart: '20:00', lateFeeBase: 30, representative: '赵强',
   }));
   const c3 = await ds.getRepository(E.Company).save(ds.getRepository(E.Company).create({
     name: '恒信物流仓储', code: 'HXWL', lateGraceMinutes: 15, dayShiftStart: '09:00',
-    nightShiftStart: '21:00', lateFeeBase: 15, representative: '赵强',
+    nightShiftStart: '21:00', lateFeeBase: 15, representative: '周婷',
   }));
 
   // ---------- 用户 ----------

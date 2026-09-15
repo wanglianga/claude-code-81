@@ -209,32 +209,81 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   const reviewDenied = await req('POST', `/appeals/${appealId}/review`, { action: 'reject', reply: 'x' }, tEmp2);
   check('员工处理申诉被拒(403)', reviewDenied.status === 403, reviewDenied.status);
 
-  // 9. 线路调整双确认（东线 3 家共线，需三家 HR + 员工代表）
+  // 9. 线路调整完整双确认（东线 l1 三家共线：每家 HR + 每家配置的员工代表）
+  const tEmpZhao = await login('emp_zhao');  // 赵强 = 瑞丰 representative
+  const tEmpZhou = await login('emp_zhou');  // 周婷 = 恒信 representative
+  const tEmpXu = await login('emp_xu');      // 徐静 = 普通员工（非代表）
+  const tHr3b = tHr3;
   const proposals = (await req('GET', '/proposals', null, tOp)).json;
-  const seedProposal = proposals.find(p => p.status === 'proposed');
-  // 员工代表先确认（验证双方可并行）
-  const ecEarly = await req('POST', `/proposals/${seedProposal.id}/confirm/employee`, { note: '员工代表先表态（E2E）' }, tEmp);
-  check('员工代表可先行确认（状态仍需企业集齐）', ok(ecEarly) && ecEarly.json.status === 'proposed', ecEarly.json);
-  for (const [name, tk] of [['华星', tHr], ['瑞丰', tHr2], ['恒信', tHr3]]) {
+  const seedProposal = proposals.find(p => p.status === 'proposed' && p.lineId === 1);
+
+  // 非代表员工不能代表员工侧确认
+  const nonRep = await req('POST', `/proposals/${seedProposal.id}/confirm/employee`, { note: '普通员工尝试' }, tEmpXu);
+  check('非代表员工确认被拒(403)', nonRep.status === 403 && /员工代表/.test(JSON.stringify(nonRep.json)), nonRep.json);
+
+  // 普通员工冒充企业侧确认
+  const empAsHr = await req('POST', `/proposals/${seedProposal.id}/confirm/company`, {}, tEmp);
+  check('员工不能代表企业侧确认(403)', empAsHr.status === 403, empAsHr.status);
+
+  // 三家 HR 确认，但零员工代表 → operator 发布必须 4xx 且无任何落地
+  for (const [name, tk] of [['华星', tHr], ['瑞丰', tHr2], ['恒信', tHr3b]]) {
     const cc = await req('POST', `/proposals/${seedProposal.id}/confirm/company`, { note: `${name}同意（E2E）` }, tk);
     check(`${name} HR 确认提案`, ok(cc), cc.json);
   }
+  const linesBefore = (await req('GET', '/lines', null, tOp)).json;
+  const lineBefore = linesBefore.find(l => l.id === 1);
+  const disNotisBefore = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  const applyNoRep = await req('POST', `/proposals/${seedProposal.id}/apply`, null, tOp);
+  check('三家 HR 但零员工代表时发布返回 4xx', applyNoRep.status >= 400 && applyNoRep.status < 500, applyNoRep.status);
+  const afterBlocked = (await req('GET', '/proposals', null, tOp)).json.find(p => p.id === seedProposal.id);
+  const lineAfterBlocked = (await req('GET', '/lines', null, tOp)).json.find(l => l.id === 1);
+  check('拒绝发布后提案状态不变（company_confirmed）', afterBlocked.status === 'company_confirmed', afterBlocked.status);
+  check('拒绝发布后线路状态不变', lineAfterBlocked.status === lineBefore.status, { before: lineBefore.status, after: lineAfterBlocked.status });
+  const disNotisBlocked = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  check('拒绝发布不产生执行通知', disNotisBlocked === disNotisBefore, { before: disNotisBefore, after: disNotisBlocked });
+
+  // 非涉线 HR 确认：西线 l2 仅华星+瑞丰共线，恒信 HR 无权确认其提案
+  const l2 = linesBefore.find(l => l.code === 'L-WEST');
+  const pWest = await req('POST', '/proposals', {
+    lineId: l2.id, type: 'adjust', title: 'E2E 西线时刻微调', content: 'x', impactSummary: 'x',
+  }, tOp);
+  const outsider = await req('POST', `/proposals/${pWest.json.id}/confirm/company`, {}, tHr3b);
+  check('非涉线企业 HR 确认被拒(403)', outsider.status === 403 && /共线企业范围/.test(JSON.stringify(outsider.json)), outsider.json);
+  const outsiderRep = await req('POST', `/proposals/${pWest.json.id}/confirm/employee`, {}, tEmpZhou);
+  check('非涉线企业员工代表确认被拒(403)', outsiderRep.status === 403, outsiderRep.json);
+
+  // 三家员工代表（每家企业配置的 representative）逐一确认
+  for (const [cname, tk] of [['华星·李磊', tEmp], ['瑞丰·赵强', tEmpZhao], ['恒信·周婷', tEmpZhou]]) {
+    const ec = await req('POST', `/proposals/${seedProposal.id}/confirm/employee`, { note: `${cname}代表同意` }, tk);
+    check(`${cname} 员工代表确认`, ok(ec), ec.json);
+  }
   const afterAll = (await req('GET', '/proposals', null, tOp)).json.find(p => p.id === seedProposal.id);
-  check('三家企业+员工代表齐 → 双确认通过', afterAll.status === 'employee_confirmed', afterAll.status);
+  check('三家 HR + 三家员工代表齐 → 双确认通过', afterAll.status === 'employee_confirmed', afterAll.status);
+
   const ccDup = await req('POST', `/proposals/${seedProposal.id}/confirm/company`, {}, tHr);
-  check('同企业重复确认被拒', ccDup.status === 400, ccDup.json);
+  check('同企业 HR 重复确认被拒', ccDup.status === 400, ccDup.json);
+  const repDup = await req('POST', `/proposals/${seedProposal.id}/confirm/employee`, {}, tEmp);
+  check('同企业代表重复确认被拒', repDup.status === 400, repDup.json);
   const empSideDenied = await req('POST', `/proposals/${seedProposal.id}/confirm/employee`, {}, tHr);
   check('HR 不能替员工代表确认(403)', empSideDenied.status === 403, empSideDenied.status);
-  const apply = await req('POST', `/proposals/${seedProposal.id}/apply`, null, tOp);
-  check('运营发布执行（双确认后才可落地）', ok(apply) && apply.json.status === 'confirmed', apply.json);
 
-  // 单方决定防护：新建提案，仅员工确认不能发布
-  const p2 = await req('POST', '/proposals', {
-    lineId: null, type: 'new_line', title: 'E2E 单方防护测试线', content: 'x', impactSummary: 'x',
-  }, tOp);
-  await req('POST', `/proposals/${p2.json.id}/confirm/employee`, {}, tEmp);
-  const applyBlocked = await req('POST', `/proposals/${p2.json.id}/apply`, null, tOp);
-  check('缺企业确认时运营不能单方发布(400)', applyBlocked.status === 400, applyBlocked.json);
+  // operator 一次发布
+  const apply = await req('POST', `/proposals/${seedProposal.id}/apply`, null, tOp);
+  check('完整双确认后运营发布成功', ok(apply) && apply.json.status === 'confirmed', apply.json);
+  const disNotisAfter = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  check('执行通知仅落地一次', disNotisAfter - disNotisBefore === 1, { delta: disNotisAfter - disNotisBefore });
+
+  // 已闭环：重复确认与重复发布均被拒（影响不二次落地）
+  const afterClosedCc = await req('POST', `/proposals/${seedProposal.id}/confirm/company`, {}, tHr2);
+  check('发布后再确认被拒（已闭环）', afterClosedCc.status === 400, afterClosedCc.json);
+  const applyTwice = await req('POST', `/proposals/${seedProposal.id}/apply`, null, tOp);
+  check('重复发布被拒（只落地一次）', applyTwice.status === 400, applyTwice.json);
+  const disNotisTwice = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  check('重复发布不产生第二条通知', disNotisTwice === disNotisAfter, { n: disNotisTwice });
 
   // 10. 访客 + 门禁
   const newVisitor = await req('POST', '/visitors', {
