@@ -884,7 +884,11 @@ export class BusinessService {
 
   async confirmProposal(id: number, side: 'company' | 'employee', user: any, note?: string) {
     return this.ds.transaction(async (manager) => {
-      const p = await manager.getRepository(LineProposal).findOne({ where: { id } });
+      // 行锁串行化同一提案的并发确认：后来的事务在锁释放后读到已提交的最新矩阵
+      const p = await manager.getRepository(LineProposal).findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
       if (!p) throw new NotFoundException('提案不存在');
       if (['confirmed', 'rejected', 'cancelled'].includes(p.status))
         throw new BadRequestException('提案已闭环，不可再确认');
@@ -897,7 +901,8 @@ export class BusinessService {
         if (user.role !== 'hr') throw new ForbiddenException('仅涉线企业 HR 可代表企业确认');
         if (!user.companyId || !companyIds.includes(Number(user.companyId)))
           throw new ForbiddenException('贵企业不在该提案关联线路的共线企业范围内，无权确认');
-        const arr = p.companyConfirmations || [];
+        // 以锁定后读到的持久化集合为基准合并，防止并发确认互相覆盖
+        const arr = [...(p.companyConfirmations || [])];
         if (arr.find((c: any) => c.companyId === Number(user.companyId)))
           throw new BadRequestException('贵企业已完成确认，请勿重复确认');
         const company = await manager.getRepository(Company).findOne({ where: { id: Number(user.companyId) } });
@@ -914,14 +919,14 @@ export class BusinessService {
           && myCompany.representative.trim() === (user.realName || '').trim();
         if (!isRep)
           throw new ForbiddenException('您不是本企业配置的员工代表，无权代表员工确认');
-        const arr = p.employeeConfirmations || [];
+        const arr = [...(p.employeeConfirmations || [])];
         if (arr.find((c: any) => c.companyId === myCompany.id))
           throw new BadRequestException('贵企业员工代表已完成确认，请勿重复确认');
         arr.push({ companyId: myCompany.id, name: myCompany.name, confirmed: true, by: user.realName, at: now, note: note || '' });
         p.employeeConfirmations = arr;
       }
 
-      // 事务内以持久化确认集合重算状态
+      // 事务内以锁后持久化确认集合重算状态
       const m = this.matrixComplete(p, companyIds);
       p.status = m.complete ? 'employee_confirmed' : m.companiesDone ? 'company_confirmed' : 'proposed';
       await manager.getRepository(LineProposal).save(p);
@@ -944,14 +949,18 @@ export class BusinessService {
   async applyProposal(id: number, user: any) {
     if (user.role !== 'operator') throw new ForbiddenException('仅园区运营可发布执行');
     return this.ds.transaction(async (manager) => {
-      const p = await manager.getRepository(LineProposal).findOne({ where: { id } });
+      // 行锁：两个 operator 并发发布时，后者等待并读到前者已提交的 confirmed
+      const p = await manager.getRepository(LineProposal).findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
       if (!p) throw new NotFoundException('提案不存在');
       if (p.status === 'confirmed')
         throw new BadRequestException('提案已发布，请勿重复操作（影响不重复落地）');
       if (['rejected', 'cancelled'].includes(p.status))
         throw new BadRequestException('提案已驳回/取消，不可发布');
 
-      // 仅接受完整双确认，并用持久化确认集合复核，任一企业 HR 或员工代表缺失即拒绝
+      // 锁后用持久化确认集合复核完整矩阵，任一企业 HR 或员工代表缺失即回滚
       const companyIds = await this.involvedCompanyIds(manager, p);
       const m = this.matrixComplete(p, companyIds);
       if (p.status !== 'employee_confirmed' || !m.complete) {
@@ -962,10 +971,18 @@ export class BusinessService {
         );
       }
 
-      // 以下影响在事务内只落地一次
+      // 条件状态迁移：仅 employee_confirmed → confirmed 恰好一行生效，保证并发下只有一个 operator 发布成功
+      const migrated = await manager.createQueryBuilder()
+        .update(LineProposal)
+        .set({ status: 'confirmed' })
+        .where('id = :id AND status = :status', { id, status: 'employee_confirmed' })
+        .execute();
+      if (migrated.affected !== 1) {
+        throw new BadRequestException('提案已被其他操作发布，本次发布未生效（影响未落地）');
+      }
       p.status = 'confirmed';
-      await manager.getRepository(LineProposal).save(p);
 
+      // 车辆/司机/企业费用影响与执行通知在同一事务内一次写入
       let line: Line | null = null;
       if (p.lineId && ['suspend', 'relocation'].includes(p.type)) {
         line = await manager.getRepository(Line).findOne({ where: { id: p.lineId } });
@@ -975,7 +992,6 @@ export class BusinessService {
         }
       }
 
-      // 车辆/司机/企业费用影响随提案归档（estimatedSaving/impactSummary 在创建时已持久化，此处仅发布一次）
       const targets = await manager.getRepository(User).find({
         where: [{ role: 'hr', active: true }, { role: 'dispatcher', active: true }],
       });

@@ -285,6 +285,56 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     .filter(n => n.title === '线路调整已执行').length;
   check('重复发布不产生第二条通知', disNotisTwice === disNotisAfter, { n: disNotisTwice });
 
+  // 9b. 并发一致性：新提案，Promise.all 并发 3 家 HR + 3 家代表确认
+  const pConc = await req('POST', '/proposals', {
+    lineId: 1, type: 'adjust', title: 'E2E 并发确认测试', content: 'x', impactSummary: 'x',
+  }, tOp);
+  const pConcId = pConc.json.id;
+  const hrCalls = [
+    ['华星', tHr], ['瑞丰', tHr2], ['恒信', tHr3],
+  ].map(([n, tk]) =>
+    req('POST', `/proposals/${pConcId}/confirm/company`, { note: `${n}并发确认` }, tk)
+  );
+  const repCalls = [
+    ['华星·李磊', tEmp], ['瑞丰·赵强', tEmpZhao], ['恒信·周婷', tEmpZhou],
+  ].map(([n, tk]) =>
+    req('POST', `/proposals/${pConcId}/confirm/employee`, { note: `${n}并发确认` }, tk)
+  );
+  const concResults = await Promise.all([...hrCalls, ...repCalls]);
+  const concOk = concResults.filter(r => ok(r)).length;
+  check('并发 6 路确认全部成功（行锁串行合并）', concOk === 6, concResults.map(r => r.status));
+  const pConcFinal = (await req('GET', '/proposals', null, tOp)).json.find(p => p.id === pConcId);
+  check('并发确认后保留 3 家 HR 确认', (pConcFinal.companyConfirmations || []).length === 3,
+    pConcFinal.companyConfirmations?.map((c) => c.companyId));
+  check('并发确认后保留 3 家员工代表确认', (pConcFinal.employeeConfirmations || []).length === 3,
+    pConcFinal.employeeConfirmations?.map((c) => c.companyId));
+  check('并发确认无重复企业条目（每家恰 1 条）',
+    new Set(pConcFinal.companyConfirmations.map((c) => c.companyId)).size === 3
+    && new Set(pConcFinal.employeeConfirmations.map((c) => c.companyId)).size === 3);
+  check('并发确认收敛为可发布状态 employee_confirmed', pConcFinal.status === 'employee_confirmed', pConcFinal.status);
+
+  // 9c. 两个 operator 并发发布同一提案：最多一成功一 4xx，状态/通知增量恰为 1
+  const tOp2 = await login('operator2');
+  const disNotisPreRace = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  const [race1, race2] = await Promise.all([
+    req('POST', `/proposals/${pConcId}/apply`, null, tOp),
+    req('POST', `/proposals/${pConcId}/apply`, null, tOp2),
+  ]);
+  const raceSuccess = [race1, race2].filter(r => ok(r)).length;
+  const raceFail = [race1, race2].filter(r => r.status >= 400 && r.status < 500).length;
+  check('两个 operator 并发发布：恰好一成一败(4xx)', raceSuccess === 1 && raceFail === 1,
+    [race1.status, race2.status]);
+  const pRaced = (await req('GET', '/proposals', null, tOp)).json.find(p => p.id === pConcId);
+  check('并发发布后状态恰为 confirmed', pRaced.status === 'confirmed', pRaced.status);
+  const disNotisPostRace = ((await req('GET', '/notifications', null, tDis)).json)
+    .filter(n => n.title === '线路调整已执行').length;
+  check('并发发布执行通知增量恰为 1（同事务一次写入）', disNotisPostRace - disNotisPreRace === 1,
+    { before: disNotisPreRace, after: disNotisPostRace });
+  // 并发失败的事务必须回滚干净：确认矩阵未被破坏
+  check('失败事务未污染确认矩阵（仍 3+3）',
+    pRaced.companyConfirmations.length === 3 && pRaced.employeeConfirmations.length === 3);
+
   // 10. 访客 + 门禁
   const newVisitor = await req('POST', '/visitors', {
     visitorName: 'E2E访客', phone: '13000000000', hostName: '徐静',

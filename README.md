@@ -39,6 +39,7 @@ http://<宿主IP>:<CC_PUBLISH_PORT>/           # 例如 http://localhost:3081/
 |---|---|---|---|
 | 系统管理员 | `admin` | 系统管理员 | 全部基础数据与业务 |
 | 园区运营 | `operator` | 陈运营 | 线路提案、停运、申诉终裁、绩效、发布调整 |
+| 园区运营 | `operator2` | 林运营（备岗） | 同运营权限，用于并发发布互斥演示 |
 | 调度员 | `dispatcher` | 周调度 | 生成名单、派车派司机、停运、事件处置 |
 | 企业 HR | `hr_huaxing` | 孙丽华（华星电子） | 本企业考勤豁免/改费、申诉初审、企业侧双确认、访客登记 |
 | 企业 HR | `hr_ruifeng` | 吴芳（瑞丰精密） | 同上（瑞丰，迟到宽限仅 5 分钟） |
@@ -92,7 +93,7 @@ http://<宿主IP>:<CC_PUBLISH_PORT>/           # 例如 http://localhost:3081/
 | 司机安全培训 | 派车/排班校验 `safetyTrainingExpiry`，过期司机不可派车（driver03 演示拦截） |
 | 临时安检 / 企业搬迁 | 事件类型 `security_check` / `relocation`；提案类型含搬迁配套，落地后更新线路状态 |
 | 线路调整持续影响车辆/司机/企业费用 | 提案含影响评估、预计月节省、生效日期；执行后线路状态联动 |
-| 企业负责人 + 员工代表双确认 | LineProposal 双侧 confirmation（含 companyId），事务内按涉线企业矩阵重算：每家企业 HR 与每家企业配置的 representative 均确认后，运营才能发布；参与资格、闭环与重复确认全部后端强校验，发布在事务内一次落地（线路状态/通知幂等） |
+| 企业负责人 + 员工代表双确认 | LineProposal 双侧 confirmation（含 companyId），事务内 `pessimistic_write` 行锁 + JSONB 矩阵锁后合并（并发确认互不覆盖）；发布时锁后重核矩阵，并以条件状态迁移 `employee_confirmed→confirmed`（affected=1）保证两个 operator 并发仅一个发布成功；线路状态、车辆/司机/企业费用影响、执行通知在同一事务只落地一次 |
 
 ## 五、技术结构
 
@@ -142,7 +143,7 @@ cd frontend && npm install && npx vite   # 已配置 /api 代理到 localhost:30
 
 验证方式以「宿主 `docker compose up -d` 健康检查通过 + 浏览器走通上述业务流」为准。
 
-仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 59 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、双确认、访客门禁、停运通知等）：
+仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 82 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、完整双确认矩阵、**Promise.all 并发 6 路确认与两个 operator 并发发布互斥**、访客门禁、停运通知等）：
 
 ```bash
 BASE=http://host.docker.internal:3081/api node e2e-check.js

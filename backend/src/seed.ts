@@ -49,6 +49,7 @@ async function main() {
   const mk = async (u: any): Promise<any> => userRepo.save(userRepo.create({ passwordHash: pw, active: true, ...u }));
   const admin = await mk({ username: 'admin', realName: '系统管理员', role: 'admin' });
   const operator = await mk({ username: 'operator', realName: '陈运营', role: 'operator' });
+  const operator2 = await mk({ username: 'operator2', realName: '林运营(备岗)', role: 'operator' });
   const dispatcher = await mk({ username: 'dispatcher', realName: '周调度', role: 'dispatcher' });
   const hr1 = await mk({ username: 'hr_huaxing', realName: '孙丽华(华星HR)', role: 'hr', companyId: c1.id });
   const hr2 = await mk({ username: 'hr_ruifeng', realName: '吴芳(瑞丰HR)', role: 'hr', companyId: c2.id });
