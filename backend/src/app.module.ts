@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import * as entities from './entities';
 import { AuthModule } from './auth/auth.module';
 import { BusinessModule } from './business/business.module';
+import { CertificateModule } from './certificates/certificates.module';
 import { HealthController } from './health.controller';
 
 const allEntities = Object.values(entities);
@@ -28,6 +29,7 @@ const allEntities = Object.values(entities);
     }),
     AuthModule,
     BusinessModule,
+    CertificateModule,
   ],
   controllers: [HealthController],
 })

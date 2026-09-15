@@ -161,6 +161,7 @@ async function main() {
   const histEmps = [emps[0], emps[1], emps[2]];
   const aRepo = ds.getRepository(E.AttendanceRecord);
   const plannedArrive = new Date(`${yesterday}T07:55:00Z`);
+  const histRecs: any[] = [];
   for (let i = 0; i < histEmps.length; i++) {
     const e = histEmps[i];
     const late = i === 2; // 第3人额外个人迟到
@@ -172,6 +173,7 @@ async function main() {
       exempt: false, makeupFee: late ? 30 : 20,
       feeReason: `班车晚点30分钟${late ? '且个人到站点迟到' : ''}`,
     }));
+    histRecs.push(rec);
     if (i === 0) {
       // 李磊已提交申诉（昨日拥堵，HR 待审）
       await ds.getRepository(E.Appeal).save(ds.getRepository(E.Appeal).create({
@@ -188,11 +190,80 @@ async function main() {
   }));
 
   // ---------- 昨日未处理事件（调度/运营待办） ----------
-  await ds.getRepository(E.TripEvent).save(ds.getRepository(E.TripEvent).create({
+  const histEvent = await ds.getRepository(E.TripEvent).save(ds.getRepository(E.TripEvent).create({
     tripId: histTrip.id, type: 'congestion', severity: 'warning',
     description: '滨河路早高峰交通事故，拥堵约30分钟', createdById: d1.id,
     createdByRole: 'driver', status: 'open', affectedCount: 3,
     compensationType: 'none',
+  }));
+
+  // ---------- 昨日事故晚点：平台已取证生成晚点考勤豁免证明（待 HR 批量确认） ----------
+  const certRepo = ds.getRepository(E.LateCertificate);
+  const itemRepo = ds.getRepository(E.LateCertificateAffected);
+  const reviewRepo = ds.getRepository(E.LineReview);
+  const certNo = `LATE-${yesterday.replace(/-/g, '')}-0001`;
+  const reasonText = '道路交通事故（科技大桥上匝道·滨河路方向）导致东线（滨河—园区）晚到园区约 30 分钟';
+  const incidentAt = new Date(`${yesterday}T07:22:00Z`);
+  const seedCert = await certRepo.save(certRepo.create({
+    certNo, tripId: histTrip.id, eventId: histEvent.id,
+    date: yesterday, scheduleId: sMorning.id, lineId: l1.id,
+    driverId: d1.id, vehicleId: v2.id,
+    reasonType: 'accident', reasonText,
+    incidentLocation: '科技大桥上匝道（滨河路方向）', incidentAt,
+    gpsDepartAt: histTrip.actualDepart, gpsArriveAt: histTrip.actualArrive,
+    plannedArrive, delayMinutes: 30, boardedCount: 3,
+    status: 'pending_hr', systemGenerated: true,
+    evidence: {
+      sources: ['GPS 车辆定位', '站点扫码签到', '到厂打卡时间', '企业考勤规则'],
+      gps: {
+        vehiclePlate: v2.plate, actualDepart: histTrip.actualDepart, actualArrive: histTrip.actualArrive,
+        plannedArrive, routeDelayMinutes: 30,
+        incidentLocation: '科技大桥上匝道（滨河路方向）', incidentAt,
+        trackSummary: `GPS 轨迹：车辆 ${v2.plate} 于 07:15 离场，08:25 抵达园区，计划到厂 07:55，科技大桥上匝道段低速滞留约28分钟，途中晚点 30 分钟`,
+      },
+      stationCheckins: histEmps.map((e, i) => ({
+        employeeId: e.id, employeeNo: e.employeeNo, employeeName: e.realName, companyId: e.companyId,
+        station: ['滨河家园', '东湖路口', '市民中心'][i], boardedAt: new Date(`${yesterday}T0${7}:${12 + i}:00Z`),
+        status: 'boarded',
+      })),
+      rules: [{
+        companyId: c1.id, companyName: c1.name, graceMinutes: 10, shiftStart: '08:30',
+        lateFeeBase: 20, affectedCount: 3, overGraceCount: 3,
+      }],
+      event: { id: histEvent.id, type: 'congestion', typeName: '道路交通事故', description: histEvent.description, status: 'open' },
+    },
+    impactSummary: {
+      totalEmployees: 3, delayMinutes: 30, lineName: l1.name, scheduleName: sMorning.name, shiftLabel: '白班',
+      companies: [{
+        companyId: c1.id, companyName: c1.name, scheduleId: sMorning.id,
+        scheduleName: sMorning.name, shiftLabel: '白班', count: 3, overGraceCount: 3, feeTotal: 70,
+      }],
+    },
+    generatorNote: '到厂自动取证：晚点 30 分钟 ≥ 阈值且关联道路事故事件',
+    createdById: d1.id, createdByRole: 'driver',
+  }));
+  for (let i = 0; i < histEmps.length; i++) {
+    await itemRepo.save(itemRepo.create({
+      certificateId: seedCert.id, employeeId: histEmps[i].id, companyId: c1.id,
+      scheduleId: sMorning.id, attendanceId: histRecs[i].id,
+      stationName: ['滨河家园', '东湖路口', '市民中心'][i],
+      boardedAt: new Date(`${yesterday}T07:${12 + i}:00Z`),
+      lateMinutes: histRecs[i].lateMinutes, graceMinutes: 10,
+      originalFee: histRecs[i].makeupFee, status: 'pending', writeback: false,
+    }));
+  }
+  const seedReview = await reviewRepo.save(reviewRepo.create({
+    lineId: l1.id, certificateId: seedCert.id, tripId: histTrip.id, date: yesterday,
+    title: `${l1.name} ${sMorning.name} 晚点复盘（${certNo}）`,
+    rootCause: reasonText, delayMinutes: 30, affectedCount: 3, exemptedCount: 0, status: 'open',
+  }));
+  seedCert.reviewId = seedReview.id;
+  await certRepo.save(seedCert);
+  // 通知华星 HR 批量处理
+  await ds.getRepository(E.Notification).save(ds.getRepository(E.Notification).create({
+    userId: hr1.id, title: '晚点考勤豁免证明待确认',
+    content: `${certNo}：${reasonText}。贵司 3 名员工受影响，请批量确认豁免并回写考勤。`,
+    category: 'warning',
   }));
 
   // ---------- 节假日/调休/天气停运示例 ----------

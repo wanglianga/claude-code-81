@@ -15,6 +15,7 @@ const routes = [
       { path: 'events', component: () => import('./pages/Events.vue'), title: '途中事件五方协同' },
       { path: 'attendance', component: () => import('./pages/Attendance.vue'), title: '考勤档案', roles: ['hr', 'operator', 'admin', 'dispatcher'] },
       { path: 'appeals', component: () => import('./pages/Appeals.vue'), title: '迟到申诉', roles: ['hr', 'operator', 'admin'] },
+      { path: 'certificates', component: () => import('./pages/Certificates.vue'), title: '晚点考勤豁免证明', roles: ['hr', 'operator', 'admin', 'dispatcher'] },
       { path: 'performance', component: () => import('./pages/Performance.vue'), title: '司机绩效', roles: ['operator', 'admin', 'dispatcher', 'hr', 'driver'] },
       { path: 'proposals', component: () => import('./pages/Proposals.vue'), title: '线路调整双确认' },
       { path: 'visitors', component: () => import('./pages/Visitors.vue'), title: '访客与门禁', roles: ['hr', 'operator', 'dispatcher', 'admin'] },

@@ -8,6 +8,7 @@ import {
   AttendanceRecord, TripEvent, Appeal, DriverPerformance, LineProposal,
   VisitorPass, GateLog, Holiday, Notification,
 } from '../entities';
+import { CertificateService } from '../certificates/certificates.service';
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const ROUTE_MINUTES = 45; // 计划车程（分钟），用于计算到厂晚点
@@ -38,6 +39,7 @@ export class BusinessService {
     @InjectRepository(GateLog) private gateLogs: Repository<GateLog>,
     @InjectRepository(Holiday) private holidays: Repository<Holiday>,
     @InjectRepository(Notification) private notifications: Repository<Notification>,
+    private certificates: CertificateService,
     private ds: DataSource,
   ) {}
 
@@ -542,6 +544,10 @@ export class BusinessService {
     }
     await this.notifyRoles(['dispatcher', 'operator'], '车次到厂',
       `${trip.date} ${sched.name} 已到厂，晚点 ${trip.delayMinutes} 分钟，考勤档案与司机绩效已归档。`);
+
+    // 晚点且存在道路事故等外部事件时，平台自动取证生成晚点考勤豁免证明（待 HR 批量确认）
+    await this.certificates.maybeAutoGenerate(id);
+
     return { ok: true, delayMinutes: trip.delayMinutes };
   }
 

@@ -366,6 +366,108 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   check('调度收到站点施工通知', disNotis.some(n => n.title.includes('站点状态变更')), disNotis.map(n => n.title));
   await req('POST', `/stations/${stnId}`, { status: 'normal' }, tDis);
 
+  // 13. 晚点考勤豁免证明：种子证明（昨日道路事故）越权校验 + HR 批量确认回写
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const certsHr = (await req('GET', '/late-certificates', null, tHr)).json;
+  const seedCert = certsHr.find(c => c.certNo === `LATE-${yesterday.replace(/-/g, '')}-0001`);
+  check('华星 HR 看到待确认的种子晚点证明', !!seedCert && seedCert.status === 'pending_hr' && seedCert.pendingCount === 3, seedCert);
+
+  const certsHr2 = (await req('GET', '/late-certificates', null, tHr2)).json;
+  check('非涉事企业（瑞丰）HR 列表不可见该证明', !certsHr2.some(c => c.id === seedCert.id), certsHr2.map(c => c.id));
+
+  const seedDetail = (await req('GET', `/late-certificates/${seedCert.id}`, null, tHr)).json;
+  check('证明含四类取证来源',
+    JSON.stringify(seedDetail.evidence.sources).includes('GPS') &&
+    seedDetail.evidence.stationCheckins.length === 3 &&
+    seedDetail.evidence.rules[0].graceMinutes === 10, seedDetail.evidence);
+
+  // 员工端看到的晚点原因与 HR 端同源
+  const myCertsLi = (await req('GET', '/my/late-certificates', null, tEmp)).json;
+  const mySeed = myCertsLi.find(c => c.id === seedCert.id);
+  check('员工端可见本人晚点证明', !!mySeed && mySeed.item.status === 'pending', mySeed);
+  check('员工端与 HR 端晚点原因完全一致（同一 reasonText）',
+    !!mySeed && mySeed.reasonText === seedDetail.reasonText,
+    { emp: mySeed?.reasonText, hr: seedDetail.reasonText });
+
+  // 越权：瑞丰 HR 不能处理华星证明；员工不能批量处理；无关员工不能看详情
+  const cross = await req('POST', `/late-certificates/${seedCert.id}/batch-confirm`, { companyId: 1 }, tHr2);
+  check('跨企业 HR 批量处理被拒(403)', cross.status === 403, cross.status);
+  const empBatch = await req('POST', `/late-certificates/${seedCert.id}/batch-confirm`, {}, tEmp2);
+  check('员工批量处理被拒(403)', empBatch.status === 403, empBatch.status);
+  const zhaoDetail = await req('GET', `/late-certificates/${seedCert.id}`, null, await login('emp_zhao'));
+  check('无关员工查看证明详情被拒(403)', zhaoDetail.status === 403, zhaoDetail.status);
+
+  // 华星 HR 批量确认 → 回写考勤/司机绩效/线路复盘
+  const seedConfirm = await req('POST', `/late-certificates/${seedCert.id}/batch-confirm`, {
+    companyId: 1, note: '与交警事故通报一致，统一豁免（E2E）',
+  }, tHr);
+  check('HR 批量确认 3 人并回写', ok(seedConfirm) && seedConfirm.json.processed === 3
+    && seedConfirm.json.status === 'confirmed', seedConfirm.json);
+
+  const yAtt = (await req('GET', `/attendance?date=${yesterday}`, null, tHr)).json;
+  const seedAtt = yAtt.filter(a => a.certificateId === seedCert.id);
+  check('3 条昨日考勤回写为豁免、补车费清零',
+    seedAtt.length === 3 && seedAtt.every(a => a.status === 'exempt' && a.makeupFee === 0 && a.exempt === true),
+    seedAtt.map(a => ({ s: a.status, fee: a.makeupFee })));
+  check('回写的豁免原因引用同一证明编号与晚点原因',
+    seedAtt.every(a => (a.exemptReason || '').includes(seedCert.certNo) && (a.exemptReason || '').includes('道路交通事故')),
+    seedAtt[0]?.exemptReason);
+
+  const yTrips = (await req('GET', `/trips?date=${yesterday}`, null, tDis)).json;
+  const histTripId = yTrips[0]?.id;
+  const perfs = (await req('GET', '/performances', null, tDrv)).json;
+  const histPerf = perfs.find(p => p.tripId === histTripId);
+  check('司机绩效联动：非司机责任撤销晚点扣分（100分/0罚）',
+    !!histPerf && histPerf.safetyScore === 100 && histPerf.penalty === 0 && histPerf.certificateId === seedCert.id, histPerf);
+
+  const reviews = (await req('GET', '/line-reviews', null, tOp)).json;
+  const seedReview = reviews.find(r => r.certificateId === seedCert.id);
+  check('线路复盘联动生成并已复盘（豁免3人、含整改措施）',
+    !!seedReview && seedReview.status === 'reviewed' && seedReview.exemptedCount === 3
+    && /缓冲|监控|区间车/.test(seedReview.measures || ''), seedReview);
+
+  const mySeedAfter = (await req('GET', '/my/late-certificates', null, tEmp)).json.find(c => c.id === seedCert.id);
+  check('员工端同步显示已豁免回写', mySeedAfter.item.status === 'exempt' && mySeedAfter.item.writeback === true, mySeedAfter?.item);
+  const closedAgain = await req('POST', `/late-certificates/${seedCert.id}/batch-confirm`, {}, tHr);
+  check('已闭环证明重复处理被拒', closedAgain.status === 400, closedAgain.status);
+
+  // 14. 今日到厂车次：平台取证生成新证明（道路事故），多企业按企业分批确认
+  const genAccident = await req('POST', '/late-certificates/generate', {
+    tripId, reasonType: 'accident', incidentLocation: '科技大桥上匝道（E2E）',
+  }, tDis);
+  check('平台对到厂车次取证生成晚点证明', ok(genAccident) && genAccident.json.certNo && genAccident.json.impactSummary.totalEmployees === 8, genAccident.json);
+  const newCertId = genAccident.json.id;
+  const dupGen = await req('POST', '/late-certificates/generate', { tripId, reasonType: 'accident' }, tDis);
+  check('同一车次重复生成证明被拒', dupGen.status === 400, dupGen.json);
+  const empGen = await req('POST', '/late-certificates/generate', { tripId, reasonType: 'accident' }, tEmp);
+  check('员工无权生成证明(403)', empGen.status === 403, empGen.status);
+
+  const companies = (await req('GET', '/companies', null, tHr)).json;
+  const cHx = companies.find(c => c.code === 'HX').id;
+  const cRf = companies.find(c => c.code === 'RF').id;
+  const cWl = companies.find(c => c.code === 'HXWL').id;
+
+  const cfHx = await req('POST', `/late-certificates/${newCertId}/batch-confirm`, { companyId: cHx }, tHr);
+  check('华星批次确认 3 人，证明转为部分处理',
+    ok(cfHx) && cfHx.json.processed === 3 && cfHx.json.status === 'partially_confirmed', cfHx.json);
+  const cfRfCross = await req('POST', `/late-certificates/${newCertId}/batch-confirm`, { companyId: cHx }, tHr2);
+  check('瑞丰 HR 越权处理华星批次被拒(403)', cfRfCross.status === 403, cfRfCross.status);
+  const cfRf = await req('POST', `/late-certificates/${newCertId}/batch-confirm`, { companyId: cRf }, tHr2);
+  check('瑞丰批次确认 3 人', ok(cfRf) && cfRf.json.processed === 3, cfRf.json);
+  const cfWl = await req('POST', `/late-certificates/${newCertId}/batch-confirm`, { companyId: cWl }, tHr3);
+  check('恒信批次确认 2 人后证明整体 confirmed',
+    ok(cfWl) && cfWl.json.processed === 2 && cfWl.json.status === 'confirmed', cfWl.json);
+
+  const todayAtt = (await req('GET', `/attendance?date=${today}`, null, tOp)).json;
+  const newAtt = todayAtt.filter(a => a.certificateId === newCertId);
+  check('批量处理结果回写考勤系统：8 条考勤挂同一证明', newAtt.length === 8, newAtt.length);
+  const hrView = (await req('GET', `/late-certificates/${newCertId}`, null, tHr)).json;
+  const empView = (await req('GET', '/my/late-certificates', null, tEmp)).json.find(c => c.id === newCertId);
+  check('新证明员工端与 HR 端晚点原因仍一致', empView.reasonText === hrView.reasonText && /道路交通事故/.test(empView.reasonText),
+    { emp: empView?.reasonText, hr: hrView?.reasonText });
+  const newPerf = (await req('GET', '/performances', null, tDrv)).json.find(p => p.tripId === tripId);
+  check('今日车次司机绩效随证明确认撤销晚点扣分', newPerf.safetyScore === 100 && newPerf.certificateId === newCertId, newPerf);
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('脚本异常', e); process.exit(2); });

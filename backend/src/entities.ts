@@ -147,6 +147,93 @@ export class Reservation {
   @UpdateDateColumn() updatedAt: Date;
 }
 
+// ============ 晚点考勤豁免证明 ============
+// 道路事故等班车晚点场景：平台依据 GPS、站点签到、到厂时间与企业规则自动取证生成，
+// 标明影响企业与班次，HR 按「企业 × 班次」批量确认后，一次回写考勤/司机绩效/线路复盘。
+@Entity('late_certificates')
+export class LateCertificate {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ unique: true }) certNo: string;          // 证明编号，如 LATE-20260915-0007
+  @Column({ nullable: true }) tripId: number;
+  @Column({ nullable: true }) eventId: number;       // 关联途中事件（事故上报）
+  @Column() date: string;                            // 乘车日期（type:date）
+  @Column({ nullable: true }) scheduleId: number;
+  @Column({ nullable: true }) lineId: number;
+  @Column({ nullable: true }) driverId: number;
+  @Column({ nullable: true }) vehicleId: number;
+  // accident | congestion | breakdown | construction | detour | weather | other
+  @Column() reasonType: string;
+  @Column() reasonText: string;                      // 统一晚点原因，员工端/HR端看到同一份
+  @Column({ nullable: true }) incidentLocation: string;
+  @Column({ type: 'timestamptz', nullable: true }) incidentAt: Date;
+  @Column({ type: 'timestamptz', nullable: true }) gpsDepartAt: Date;   // GPS 实际离场
+  @Column({ type: 'timestamptz', nullable: true }) gpsArriveAt: Date;   // GPS 到厂
+  @Column({ type: 'timestamptz', nullable: true }) plannedArrive: Date; // 计划到厂
+  @Column({ default: 0 }) delayMinutes: number;
+  @Column({ default: 0 }) boardedCount: number;
+  // auto_generated（平台自动生成）| pending_hr（待HR确认）| confirmed（已确认并回写）
+  // | partially_confirmed（部分企业/班次确认）| rejected | cancelled
+  @Column({ default: 'auto_generated' }) status: string;
+  @Column({ default: false }) systemGenerated: boolean;
+  @Column({ type: 'jsonb', nullable: true }) evidence: any;            // 取证摘要（GPS/签到/规则）
+  @Column({ type: 'jsonb', nullable: true }) impactSummary: any;       // 影响企业×班次汇总
+  @Column({ type: 'text', nullable: true }) generatorNote: string;
+  @Column({ nullable: true }) createdById: number;
+  @Column({ nullable: true }) createdByRole: string;
+  @Column({ type: 'timestamptz', nullable: true }) confirmedAt: Date;  // 全部批次回写完成
+  @Column({ nullable: true }) reviewId: number;        // 关联线路复盘
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
+  @OneToMany('LateCertificateAffected', 'certificate') items: any[];
+}
+
+// 证明影响名单：受影响员工（按企业 × 班次展开，便于批量处理）
+@Entity('late_certificate_affected')
+export class LateCertificateAffected {
+  @PrimaryGeneratedColumn() id: number;
+  @ManyToOne('LateCertificate', 'items', { onDelete: 'CASCADE' })
+  certificate: LateCertificate;
+  @Column() certificateId: number;
+  @Column() employeeId: number;
+  @Column() companyId: number;
+  @Column({ nullable: true }) scheduleId: number;
+  @Column({ nullable: true }) attendanceId: number;   // 回写的考勤档案
+  @Column({ nullable: true }) stationName: string;    // 签到站点
+  @Column({ type: 'timestamptz', nullable: true }) boardedAt: Date; // 站点签到时间
+  @Column({ default: 0 }) lateMinutes: number;
+  @Column({ default: 0 }) graceMinutes: number;       // 企业宽限规则快照
+  @Column({ default: 0 }) originalFee: number;        // 原补车费
+  // pending（待本企业HR处理）| exempt（已豁免回写）| rejected（HR驳回）
+  @Column({ default: 'pending' }) status: string;
+  @Column({ default: false }) writeback: boolean;     // 是否已回写考勤系统
+  @Column({ nullable: true }) handledById: number;
+  @Column({ type: 'timestamptz', nullable: true }) handledAt: Date;
+  @Column({ nullable: true }) handleNote: string;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// ============ 线路复盘（晚点证明确认后联动生成/更新） ============
+@Entity('line_reviews')
+export class LineReview {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ nullable: true }) lineId: number;
+  @Column({ nullable: true }) certificateId: number;
+  @Column({ nullable: true }) tripId: number;
+  @Column({ type: 'date' }) date: string;
+  @Column() title: string;
+  @Column({ type: 'text' }) rootCause: string;        // 与晚点证明一致的晚点原因
+  @Column({ type: 'text', nullable: true }) measures: string;  // 整改措施
+  @Column({ default: 0 }) delayMinutes: number;
+  @Column({ default: 0 }) affectedCount: number;
+  @Column({ default: 0 }) exemptedCount: number;
+  // open（待复盘）| reviewed（已复盘）
+  @Column({ default: 'open' }) status: string;
+  @Column({ nullable: true }) handledById: number;
+  @Column({ type: 'timestamptz', nullable: true }) reviewedAt: Date;
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
+}
+
 // ============ 考勤到厂档案 ============
 @Entity('attendance_records')
 export class AttendanceRecord {
@@ -166,6 +253,7 @@ export class AttendanceRecord {
   @Column({ nullable: true }) exemptReason: string;
   @Column({ default: 0 }) makeupFee: number;      // 补车费用
   @Column({ nullable: true }) feeReason: string;
+  @Column({ nullable: true }) certificateId: number; // 晚点考勤豁免证明回写来源
 }
 
 // ============ 途中事件（五方协同） ============
@@ -221,6 +309,7 @@ export class DriverPerformance {
   @Column({ default: 0 }) bonus: number;
   @Column({ default: 0 }) penalty: number;
   @Column({ nullable: true }) note: string;
+  @Column({ nullable: true }) certificateId: number; // 晚点证明联动（非责任晚点可撤销扣分）
 }
 
 // ============ 线路调整提案（双确认） ============

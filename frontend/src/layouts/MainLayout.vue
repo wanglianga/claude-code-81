@@ -20,6 +20,9 @@
         <el-menu-item v-if="['hr','operator','admin'].includes(role)" index="/appeals">
           <el-icon><ChatDotSquare/></el-icon><span>迟到申诉</span>
           <el-badge v-if="pendingAppeals>0" :value="pendingAppeals" class="badge-dot"/></el-menu-item>
+        <el-menu-item v-if="['hr','operator','admin','dispatcher'].includes(role)" index="/certificates">
+          <el-icon><Document/></el-icon><span>晚点豁免证明</span>
+          <el-badge v-if="pendingCerts>0" :value="pendingCerts" class="badge-dot"/></el-menu-item>
         <el-menu-item v-if="['operator','admin','dispatcher','hr','driver'].includes(role)" index="/performance">
           <el-icon><TrophyBase/></el-icon><span>司机绩效</span></el-menu-item>
         <el-menu-item index="/proposals"><el-icon><Share/></el-icon><span>线路调整双确认</span></el-menu-item>
@@ -82,6 +85,7 @@ const notifications = ref<any[]>([]);
 const unread = computed(() => notifications.value.filter(n => !n.read).length);
 const openEvents = ref(0);
 const pendingAppeals = ref(0);
+const pendingCerts = ref(0);
 
 async function load() {
   try {
@@ -90,6 +94,10 @@ async function load() {
     const dash = await api.get('/dashboard');
     openEvents.value = dash.data.openEvents;
     pendingAppeals.value = dash.data.pendingAppeals;
+    if (['hr', 'dispatcher', 'operator', 'admin'].includes(role)) {
+      const certs = (await api.get('/late-certificates')).data;
+      pendingCerts.value = certs.filter((c: any) => (c.pendingCount || 0) > 0).length;
+    }
   } catch { /* ignore */ }
 }
 function go(path: string) { router.push(path); }

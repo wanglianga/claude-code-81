@@ -40,7 +40,18 @@ export const EVENT_TYPES: Record<string, string> = {
   congestion: '道路拥堵', breakdown: '车辆故障', construction: '站点施工',
   missed_bus: '员工错过班车', overtime: '企业临时加班', detour: '司机绕行',
   late_arrival: '班车到厂晚点', weather: '极端天气', suspension: '停运',
-  security_check: '临时安检/代刷', relocation: '企业搬迁',
+  security_check: '临时安检/代刷', relocation: '企业搬迁', accident: '道路交通事故',
+};
+
+// 晚点证明统一晚点原因字典（与后端 CERT_REASONS 一致，员工端/HR端共用同一份文案）
+export const CERT_REASONS: Record<string, string> = {
+  accident: '道路交通事故',
+  congestion: '道路拥堵',
+  breakdown: '车辆故障',
+  construction: '道路/站点施工',
+  detour: '交通管制绕行',
+  weather: '极端天气',
+  other: '其他非员工原因',
 };
 
 export const STATUS: Record<string, { label: string; type: string }> = {
@@ -75,6 +86,10 @@ export const STATUS: Record<string, { label: string; type: string }> = {
   available: { label: '可用', type: 'success' },
   in_use: { label: '使用中', type: 'primary' },
   maintenance: { label: '保养中', type: 'warning' },
+  auto_generated: { label: '平台已生成', type: 'info' },
+  pending_hr: { label: '待HR确认', type: 'danger' },
+  partially_confirmed: { label: '部分企业已处理', type: 'warning' },
+  reviewed: { label: '已复盘', type: 'success' },
 };
 
 export function st(s: string) {

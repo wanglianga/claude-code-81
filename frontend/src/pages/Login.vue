@@ -51,6 +51,7 @@ async function login() {
   try {
     const { data } = await api.post('/auth/login', form);
     localStorage.setItem('token', data.token);
+    localStorage.setItem('uid', data.user.id);
     localStorage.setItem('role', data.user.role);
     localStorage.setItem('realName', data.user.realName);
     localStorage.setItem('companyName', data.user.companyName || '');
