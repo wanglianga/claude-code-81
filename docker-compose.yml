@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-commute}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-commute123}
+      POSTGRES_DB: ${DB_NAME:-commute}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 数据库端口不发布到宿主，仅在 compose 内部网络访问
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-commute} -d ${DB_NAME:-commute}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-commute}
+      DB_PASSWORD: ${DB_PASSWORD:-commute123}
+      DB_NAME: ${DB_NAME:-commute}
+      JWT_SECRET: ${JWT_SECRET:-commute-platform-dev-secret}
+      TZ: Asia/Shanghai
+    ports:
+      - "${CC_PUBLISH_PORT}:3000"
+
+volumes:
+  pgdata:

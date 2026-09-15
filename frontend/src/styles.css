@@ -1,0 +1,49 @@
+:root {
+  --brand: #1f6feb;
+  --brand-dark: #0b3d91;
+  --bg: #f2f5fa;
+}
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: #1f2937;
+}
+.page-title { font-size: 20px; font-weight: 700; margin: 0 0 14px; color: #111827; }
+.section-title { font-size: 15px; font-weight: 700; margin: 4px 0 12px; color: #374151; }
+.card-soft { border-radius: 10px; border: none; }
+.stat-num { font-size: 28px; font-weight: 800; line-height: 1.1; }
+.stat-label { color: #6b7280; font-size: 13px; margin-top: 4px; }
+.muted { color: #9ca3af; font-size: 12px; }
+.login-bg {
+  height: 100vh;
+  background: linear-gradient(135deg, #0b3d91 0%, #1f6feb 55%, #38bdf8 100%);
+  display: flex; align-items: center; justify-content: center;
+}
+.login-card {
+  width: 420px; background: #fff; border-radius: 16px; padding: 34px 34px 26px;
+  box-shadow: 0 24px 60px rgba(0,0,0,.25);
+}
+.login-logo { font-size: 22px; font-weight: 800; color: var(--brand-dark); }
+.login-sub { color: #6b7280; font-size: 13px; margin: 6px 0 22px; }
+.quick-account {
+  cursor: pointer; padding: 6px 10px; border-radius: 6px; font-size: 12px;
+  background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0;
+}
+.quick-account:hover { background: #e0ecff; border-color: var(--brand); color: var(--brand); }
+.el-menu { border-right: none !important; }
+.brand-side {
+  color: #fff; font-weight: 800; font-size: 16px; padding: 18px 16px 14px; line-height: 1.4;
+}
+.brand-side small { display: block; font-weight: 400; font-size: 11px; opacity: .75; margin-top: 2px; }
+.trip-flow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.flow-step {
+  padding: 3px 10px; border-radius: 20px; font-size: 12px;
+  background: #e5e7eb; color: #6b7280;
+}
+.flow-step.active { background: var(--brand); color: #fff; }
+.flow-step.danger { background: #f56c6c; color: #fff; }
+.json-box {
+  background: #0f172a; color: #a7f3d0; border-radius: 8px; padding: 10px;
+  font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow: auto;
+}
