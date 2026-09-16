@@ -30,6 +30,7 @@
         <el-menu-item v-if="['operator','admin','dispatcher','hr','driver'].includes(role)" index="/performance">
           <el-icon><TrophyBase/></el-icon><span>司机绩效</span></el-menu-item>
         <el-menu-item index="/proposals"><el-icon><Share/></el-icon><span>线路调整双确认</span></el-menu-item>
+        <el-menu-item v-if="['operator','admin','dispatcher','hr','employee'].includes(role)" index="/line-relocations"><el-icon><OfficeBuilding/></el-icon><span>搬迁线路重排</span></el-menu-item>
         <el-menu-item v-if="['hr','operator','dispatcher','admin'].includes(role)" index="/visitors">
           <el-icon><Avatar/></el-icon><span>访客与门禁</span></el-menu-item>
         <el-menu-item v-if="['operator','admin','dispatcher'].includes(role)" index="/base-data">

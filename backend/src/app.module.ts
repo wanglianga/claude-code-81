@@ -7,6 +7,7 @@ import { BusinessModule } from './business/business.module';
 import { CertificateModule } from './certificates/certificates.module';
 import { RelocationModule } from './relocations/relocations.module';
 import { SupplementModule } from './supplements/supplements.module';
+import { LineRelocationModule } from './relocations-line/line-relocation.module';
 import { HealthController } from './health.controller';
 
 const allEntities = Object.values(entities);
@@ -34,6 +35,7 @@ const allEntities = Object.values(entities);
     CertificateModule,
     RelocationModule,
     SupplementModule,
+    LineRelocationModule,
   ],
   controllers: [HealthController],
 })

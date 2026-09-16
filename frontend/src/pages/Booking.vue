@@ -1,6 +1,27 @@
 <template>
   <div>
     <h2 class="page-title">班车预约</h2>
+    <!-- 企业搬迁过渡选择 -->
+    <el-card v-if="rlChoices.length" class="card-soft" style="margin-bottom:14px;border:1px solid #409eff">
+      <template #header><b style="color:#1f6feb">🏭 您所在企业正在搬迁线路，请选择过渡期乘车方式</b></template>
+      <el-table :data="rlChoices" size="small">
+        <el-table-column label="重排单" min-width="200">
+          <template #default="{row}">{{ row.relocation.rlNo }} · {{ row.relocation.title }}<div class="muted">新线生效 {{ row.relocation.effectDate }}，过渡至 {{ row.relocation.transitionEnd }}</div></template>
+        </el-table-column>
+        <el-table-column label="当前选择" width="160">
+          <template #default="{row}">
+            <el-tag size="small" :type="row.choice==='refund'?'danger':row.choice==='keep_old'?'warning':'success'">{{ rlChoiceName(row.choice) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="260">
+          <template #default="{row}">
+            <el-button size="small" @click="rlChoose(row,'keep_old')">继续旧站点</el-button>
+            <el-button size="small" type="primary" @click="rlChoose(row,'refund')">退订</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <!-- 临时改站确认 -->
     <el-card v-if="relos.length" class="card-soft" style="margin-bottom:14px;border:1px solid #f56c6c">
       <template #header><b style="color:#f56c6c">⚠️ 您有 {{ relos.length }} 条站点施工临时改站待确认</b></template>
@@ -126,6 +147,20 @@ const curStation = ref<any>(null);
 const form = ref({ withLuggage: false, tempOvertime: false, overtimeNote: '' });
 const holidayNote = ref('');
 const relos = ref<any[]>([]);
+const rlChoices = ref<any[]>([]);
+
+function rlChoiceName(c: string) {
+  return ({ keep_old: '过渡期继续旧站点', change_station: '改站', change_schedule: '改班次', refund: '退订' } as any)[c] || c;
+}
+async function loadRlChoices() {
+  const { data } = await api.get('/my/line-relocation-choices');
+  rlChoices.value = data;
+}
+async function rlChoose(row: any, choice: string) {
+  await api.post(`/line-relocations/${row.relocationId}/choose`, { reservationId: row.reservationId, choice });
+  ElMessage.success(choice === 'refund' ? '已退订' : '已记录，过渡期按旧站点乘车并提醒');
+  loadRlChoices(); load();
+}
 
 async function loadRelos() {
   const { data } = await api.get('/my/relocations');
@@ -154,6 +189,7 @@ async function load() {
   list.value = data;
   mine.value = my;
   loadRelos();
+  loadRlChoices();
   const h = holidays.find((x: any) => x.date === date.value);
   holidayNote.value = h ? `${h.name}（${h.type === 'suspended' ? '停运' : h.type === 'holiday' ? '节假日' : '调休上班'}）` : '';
 }

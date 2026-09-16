@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { DataSource } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import * as E from './entities';
@@ -435,6 +435,56 @@ async function main() {
       status: 'boarded', boardedAt: new Date(`${lastMonthDate}T22:40:00`),
     }));
   }
+
+  // ---------- 企业搬迁线路重排（恒信搬迁至滨湖智造园，西线冻结/意见征集） ----------
+  const rlRepo = ds.getRepository(E.LineRelocation);
+  const rlOptRepo = ds.getRepository(E.LineRelocationOption);
+  const rlFbRepo = ds.getRepository(E.LineRelocationFeedback);
+  const westScheds = await ds.getRepository(E.Schedule).find({ where: { lineId: l2.id } });
+  const westActiveRes = await rRepo.find({
+    where: { scheduleId: In(westScheds.map(s => s.id)), status: In(['booked', 'on_manifest']) },
+  });
+  const effectDay = new Date(Date.now() + 10 * 86400000).toISOString().slice(0, 10);
+  const demoRl = await rlRepo.save(rlRepo.create({
+    rlNo: `RL-${effectDay.replace(/-/g, '')}-0001`,
+    companyId: c3.id, oldLineId: l2.id,
+    title: '恒信物流搬迁至滨湖智造园 · 西线重排',
+    newSiteName: '滨湖智造园', newSiteAddress: '滨湖新区智造大道 88 号',
+    status: 'consulting', bookingFrozen: false,
+    effectDate: effectDay, transitionEnd: effectDay,
+    impact: {
+      companyName: c3.name, oldLineName: l2.name,
+      schedules: westScheds.map(s => ({ id: s.id, name: s.name, direction: s.direction, departureTime: s.departureTime, shiftLabel: s.shiftLabel })),
+      stations: westStations.map(s => ({ id: s.id, name: s.name, seq: s.seq, capacity: s.capacity, status: s.status })),
+      activeReservationCount: westActiveRes.length, employeeCount: 2,
+      reservations: westActiveRes.map(r => ({ id: r.id, employeeId: r.employeeId, companyId: r.companyId, scheduleId: r.scheduleId, stationId: r.stationId, date: r.date, status: r.status })),
+    },
+    hrScheduleNote: '新厂区两班倒，夜班需保留 22:00 接驳',
+    createdById: operator.id,
+  }));
+  const demoOpts = [
+    { name: '方案A·沿原走向北延至智造园（直达，推荐）', crossDistrict: false, addedFeePerMonth: 0, estimatedArriveMinutes: 5 },
+    { name: '方案C·跨区接驳（经东区枢纽换乘）', crossDistrict: true, addedFeePerMonth: 3600, estimatedArriveMinutes: 22 },
+  ];
+  for (let i = 0; i < demoOpts.length; i++) {
+    const o = demoOpts[i];
+    await rlOptRepo.save(rlOptRepo.create({
+      relocationId: demoRl.id, ...o, chosen: false,
+      stations: westStations.map((s, k) => ({
+        name: o.crossDistrict && k === westStations.length - 1 ? '智造园接驳枢纽' : s.name,
+        walkMeters: 180 + ((s.seq + i) % 4) * 90,
+        arriveTime: `08:${String(10 + k * 4 + i * 2).padStart(2, '0')}`,
+        transferNote: o.crossDistrict && k === 0 ? '需在枢纽换乘跨区班车' : '直达智造园',
+      })),
+      scheduleLinks: westScheds.map(s => ({ scheduleName: s.name, oldDeparture: s.departureTime, newDeparture: s.departureTime, linkNote: o.crossDistrict ? '跨区加开摆渡' : '时刻平移' })),
+    }));
+  }
+  await rlFbRepo.save(rlFbRepo.create({
+    relocationId: demoRl.id, optionId: null, employeeId: emps[6].id, verdict: 'change_request',
+    stationName: '孵化基地', walkMeters: 450, arriveTime: '08:18',
+    comment: '孵化基地步行到临停点偏元，建议保留早 07:05 班次',
+  }));
+  // 西线保持正常运营（该演示单用于展示盘点/候选/意见，真实冻结由发起流程触发）
 
   console.log('Seed finished. Accounts (password: Pass1234):');
   console.log('  admin / operator / dispatcher');

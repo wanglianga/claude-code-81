@@ -853,6 +853,101 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   const hrNotis = (await req('GET', '/notifications', null, tHr)).json;
   check('HR 收到月度账单通知', hrNotis.some(n => /月度账单/.test(n.title)), hrNotis.map(n => n.title));
 
+  // 17. 企业搬迁线路重排（tEmp=emp_li 华星员工代表，tEmp2=emp_xu 普通员工）
+  const eastLineId = morning.lineId;
+  const futureDate = new Date(Date.now() + 12 * 86400000).toISOString().slice(0, 10);
+
+  // 发起前可正常预约东线未来班次（用一条临时预约验证冻结）
+  const preBook = await req('POST', '/reservations', { date: futureDate, scheduleId: morning.id, stationId: (stBinhe2||morningTom.stations[0]).id }, tEmp2);
+  check('搬迁冻结前东线可预约', ok(preBook), preBook.json);
+
+  const rlCreate = await req('POST', '/line-relocations', {
+    companyId: cHx, oldLineId: eastLineId, newSiteName: '滨湖智造园',
+    newSiteAddress: '滨湖新区智造大道1号', effectDate: futureDate, transitionEnd: futureDate,
+  }, tOp);
+  check('发起搬迁重排：冻结原线新预约并完成盘点',
+    ok(rlCreate) && rlCreate.json.bookingFrozen === true
+    && rlCreate.json.impact.schedules.length >= 1 && rlCreate.json.impact.stations.length >= 4
+    && rlCreate.json.impact.activeReservationCount >= 1, rlCreate.json);
+  const rlId = rlCreate.json.id;
+
+  const frozenBook = await req('POST', '/reservations', { date: futureDate, scheduleId: morning.id, stationId: morningTom.stations[0].id }, tEmp2);
+  check('冻结后原线路新预约被拒', frozenBook.status === 400 && /冻结|搬迁/.test(JSON.stringify(frozenBook.json)), frozenBook.json);
+
+  const rlEmpGen = await req('POST', `/line-relocations/${rlId}/options`, {}, tEmp);
+  check('员工不能生成候选(403)', rlEmpGen.status === 403, rlEmpGen.status);
+  const genOpts = await req('POST', `/line-relocations/${rlId}/options`, {}, tOp);
+  check('生成 3 个候选（直达/东环/跨区接驳，含步行/到厂/衔接）',
+    ok(genOpts) && genOpts.json.options.length === 3
+    && genOpts.json.options.some(o => o.crossDistrict && o.addedFeePerMonth > 0)
+    && genOpts.json.options[0].stations.every(s => s.walkMeters > 0 && s.arriveTime), genOpts.json.options?.map(o => o.name));
+
+  // 普通员工不能反馈，员工代表可以
+  const fbNormal = await req('POST', `/line-relocations/${rlId}/feedback`, {
+    optionId: genOpts.json.options[0].id, verdict: 'approved',
+  }, tEmp2);
+  check('非员工代表反馈被拒(403)', fbNormal.status === 403, fbNormal.status);
+  const fbRep = await req('POST', `/line-relocations/${rlId}/feedback`, {
+    optionId: genOpts.json.options[0].id, verdict: 'change_request',
+    stationName: '滨河家园', walkMeters: 350, arriveTime: '08:20', comment: '希望保留 07:05 班次',
+  }, tEmp);
+  check('员工代表按站点/班次/步行/到厂反馈成功', ok(fbRep) && fbRep.json.id, fbRep.json);
+  const hrSum = await req('POST', `/line-relocations/${rlId}/hr-summary`, { note: '新厂区两班倒，夜班接驳必须保留' }, tHr);
+  check('HR 汇总企业排班要求', ok(hrSum) && /夜班/.test(hrSum.json.hrScheduleNote), hrSum.json);
+
+  // 形成正式方案：费用有争议时禁止锁定
+  const directOpt = genOpts.json.options[0].id;
+  const adjDispute = await req('POST', `/line-relocations/${rlId}/adjust`, {
+    optionId: directOpt,
+    costPlan: { companyShareRatio: 80, scheduleArrangement: '时刻平移', disputeNote: '跨区费用分摊待议' },
+  }, tOp);
+  check('费用分摊存在争议时不能锁定运力', adjDispute.status === 400 && /争议|费用/.test(JSON.stringify(adjDispute.json)), adjDispute.json);
+  const adjOk = await req('POST', `/line-relocations/${rlId}/adjust`, {
+    optionId: directOpt,
+    costPlan: { companyShareRatio: 80, parkSubsidyRatio: 20, scheduleArrangement: '时刻平移，保留夜班接驳' },
+    effectDate: futureDate, transitionEnd: futureDate,
+  }, tOp);
+  check('先确认费用再锁定座位/车辆，形成正式方案',
+    ok(adjOk) && adjOk.json.costLocked === true && adjOk.json.capacityLocked === true
+    && adjOk.json.status === 'adjusted' && adjOk.json.chosenOptionId === directOpt, adjOk.json);
+
+  // 顺序：企业先确认、代表再确认；代表不能先确认
+  const repEarly = await req('POST', `/line-relocations/${rlId}/confirm-employee`, {}, tEmp);
+  check('企业未确认前员工代表确认被拒', repEarly.status === 400, repEarly.status);
+  const coConf = await req('POST', `/line-relocations/${rlId}/confirm-company`, {}, tHr);
+  check('企业负责人确认', ok(coConf) && coConf.json.status === 'company_confirmed', coConf.json);
+  const empConf = await req('POST', `/line-relocations/${rlId}/confirm-employee`, {}, tEmp);
+  check('员工代表确认 → 双确认通过', ok(empConf) && empConf.json.status === 'confirmed', empConf.json);
+
+  // 生效前员工过渡选择：退订
+  const preResId = preBook.json?.id;
+  if (preResId) {
+    const chRefund = await req('POST', `/line-relocations/${rlId}/choose`, { reservationId: preResId, choice: 'refund' }, tEmp2);
+    check('过渡期员工可退订', ok(chRefund) && chRefund.json.choice === 'refund', chRefund);
+  }
+
+  // 生效：落地新线/班次/站点，旧站设停用日期，未选择员工继续旧站并提醒
+  const eff = await req('POST', `/line-relocations/${rlId}/effectuate`, {}, tOp);
+  check('生效：生成独立新线路与站点/班次，新线从生效日独立结算',
+    ok(eff) && eff.json.status === 'effective' && eff.json.newLineId
+    && eff.json.newLine.name.includes('滨湖智造园')
+    && eff.json.choices.length >= 1, eff.json);
+  const newLineId = eff.json.newLineId;
+  const newStations = (await req('GET', '/lines', null, tOp)).json;
+  const newLine = newStations.find(l => l.id === newLineId);
+  check('新线路已可查且为 active', !!newLine && newLine.status === 'active', newLine);
+  const oldStations = (await req('GET', '/lines', null, tOp)).json.find(l => l.id === eastLineId).stationList;
+  check('旧线路站点标记停用日期（搬迁停用）',
+    oldStations.every((s) => s.closedFrom === futureDate), oldStations.map((s) => s.closedFrom));
+
+  // 历史档案仍按旧线保留：昨日事故/补车等记录不受影响
+  const oldAtt = (await req('GET', `/attendance?date=${yesterday}`, null, tHr)).json;
+  check('旧线路历史考勤档案保留', oldAtt.length >= 3, oldAtt.length);
+
+  // 新线路从生效日起独立可预约（旧站停用日期后旧线不可约）
+  const newSched = (await req('GET', '/schedules', null, tOp)).json.find((s) => s.lineId === newLineId);
+  check('新线路已生成班次', !!newSched, newSched);
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('脚本异常', e); process.exit(2); });

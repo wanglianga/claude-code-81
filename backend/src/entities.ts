@@ -63,6 +63,8 @@ export class Station {
   @Column({ default: 30 }) capacity: number; // 站点容量（同批次候车人数）
   // normal | construction | closed
   @Column({ default: 'normal' }) status: string;
+  @Column({ type: 'date', nullable: true }) closedFrom: string; // 搬迁停用日期
+  @Column({ nullable: true }) closeReason: string;
   @Column({ nullable: true }) note: string;
   @ManyToOne('Line', 'stations') line: Line;
   @Column() lineId: number;
@@ -506,6 +508,87 @@ export class MonthlyBilling {
   @Column({ type: 'timestamptz', nullable: true }) confirmedAt: Date;
   @CreateDateColumn() createdAt: Date;
   @UpdateDateColumn() updatedAt: Date;
+}
+
+// ============ 企业搬迁 · 线路重排 ============
+@Entity('line_relocations')
+export class LineRelocation {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ unique: true }) rlNo: string;        // RL-YYYYMMDD-####
+  @Column() companyId: number;
+  @Column() oldLineId: number;
+  @Column({ nullable: true }) newLineId: number;  // 生效后落地的新线路
+  @Column() title: string;
+  @Column({ nullable: true }) newSiteName: string;   // 新厂区
+  @Column({ nullable: true }) newSiteAddress: string;
+  // draft（盘点中/预约冻结）| consulting（征集意见）| adjusted（运营已调整待双确认）
+  // | company_confirmed（企业侧已确认）| confirmed（双确认通过，可生效）| effective（已生效）| cancelled
+  @Column({ default: 'draft' }) status: string;
+  @Column({ default: false }) bookingFrozen: boolean; // 冻结原线新预约
+  @Column({ type: 'date' }) effectDate: string;       // 计划/实际生效日期
+  @Column({ type: 'date', nullable: true }) transitionEnd: string; // 旧线过渡期截止
+  // 影响盘点：班次/站点/在乘员工/司机工时/车辆座位/费用分摊
+  @Column({ type: 'jsonb', nullable: true }) impact: any;
+  @Column({ type: 'jsonb', nullable: true }) costPlan: any;   // 费用承担与班次安排（须先确认）
+  @Column({ type: 'jsonb', nullable: true }) capacityPlan: any; // 座位/车辆/司机工时锁定
+  @Column({ default: false }) costLocked: boolean;
+  @Column({ default: false }) capacityLocked: boolean;
+  @Column({ nullable: true }) chosenOptionId: number;
+  @Column({ nullable: true }) companyConfirmById: number;
+  @Column({ type: 'timestamptz', nullable: true }) companyConfirmedAt: Date;
+  @Column({ nullable: true }) effectiveById: number;
+  @Column({ type: 'timestamptz', nullable: true }) effectiveAt: Date;
+  @Column({ type: 'text', nullable: true }) hrScheduleNote: string; // HR 汇总的生产排班要求
+  @Column() createdById: number;
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
+}
+
+// 候选线路方案（可多份，员工代表按站点/班次/步行/到厂反馈）
+@Entity('line_relocation_options')
+export class LineRelocationOption {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() relocationId: number;
+  @Column() name: string;
+  @Column({ default: false }) crossDistrict: boolean;   // 是否需跨区接驳
+  @Column({ default: 0 }) addedFeePerMonth: number;      // 跨区接驳新增费用
+  @Column({ default: 0 }) estimatedArriveMinutes: number; // 预计到厂相对原时刻变化（分）
+  @Column({ type: 'jsonb', nullable: true }) stations: any; // [{name,walkMeters,arriveTime,transferNote}]
+  @Column({ type: 'jsonb', nullable: true }) scheduleLinks: any; // 班次衔接
+  @Column({ default: false }) chosen: boolean;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// 员工代表意见（按站点、班次、步行距离、到厂时间）
+@Entity('line_relocation_feedbacks')
+export class LineRelocationFeedback {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() relocationId: number;
+  @Column({ nullable: true }) optionId: number;
+  @Column() employeeId: number;
+  // approved（赞成）| change_request（建议调整）| rejected（反对）
+  @Column({ default: 'change_request' }) verdict: string;
+  @Column({ nullable: true }) stationName: string;
+  @Column({ nullable: true }) scheduleName: string;
+  @Column({ default: 0 }) walkMeters: number;
+  @Column({ nullable: true }) arriveTime: string;
+  @Column({ type: 'text', nullable: true }) comment: string;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// 过渡期已预约员工的选择（改站/改班次/退订/继续旧站）
+@Entity('line_relocation_choices')
+export class LineRelocationChoice {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() relocationId: number;
+  @Column() reservationId: number;
+  @Column() employeeId: number;
+  // keep_old（继续旧站点）| change_station | change_schedule | refund（退订）
+  @Column({ default: 'keep_old' }) choice: string;
+  @Column({ nullable: true }) targetStationId: number;
+  @Column({ nullable: true }) targetScheduleId: number;
+  @Column({ type: 'timestamptz', nullable: true }) decidedAt: Date;
+  @CreateDateColumn() createdAt: Date;
 }
 
 // ============ 通知 ============

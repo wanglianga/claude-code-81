@@ -7,6 +7,8 @@ import {
   Company, User, Line, Station, Schedule, Vehicle, Trip, Reservation,
   AttendanceRecord, TripEvent, Appeal, DriverPerformance, LineProposal,
   VisitorPass, GateLog, Holiday, Notification,
+  LateCertificate, LateCertificateAffected, LineReview,
+  LineRelocation, LineRelocationChoice,
 } from '../entities';
 import { CertificateService } from '../certificates/certificates.service';
 
@@ -224,6 +226,15 @@ export class BusinessService {
     if (!station || station.lineId !== sched.lineId)
       throw new BadRequestException('站点与线路不匹配');
     if (station.status === 'closed') throw new BadRequestException('该站点已关闭，请选择邻近站点');
+    // 搬迁冻结：原线路已有进行中的重排单时，停止接受新预约（过渡期内已预约不受影响）
+    const frozen = await this.ds.getRepository(LineRelocation).findOne({
+      where: { oldLineId: sched.lineId, bookingFrozen: true },
+    });
+    if (frozen && !['cancelled', 'effective'].includes(frozen.status))
+      throw new BadRequestException(`该线路因企业搬迁正在重排（${frozen.rlNo}），新预约已冻结，请在生效后改约新线路或联系调度`);
+    // 站点已设搬迁停用日期
+    if (station.closedFrom && dto.date >= station.closedFrom)
+      throw new BadRequestException(`站点「${station.name}」将于 ${station.closedFrom} 随旧线路停用，请选择新线路站点`);
     const holiday = await this.holidays.findOne({ where: { date: dto.date, type: 'suspended' } });
     if (holiday) throw new BadRequestException(`${dto.date} 因${holiday.name}停运，无法预约`);
 
