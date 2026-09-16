@@ -36,10 +36,10 @@
           </template>
         </el-table-column>
         <el-table-column prop="reasonText" label="晚点原因（两端同源）" min-width="240" show-overflow-tooltip/>
-        <el-table-column label="处理进度" width="150">
+        <el-table-column label="处理进度" width="185">
           <template #default="{row}">
             <div>共 {{ row.affectedTotal }} 人</div>
-            <div class="muted">待{{ row.pendingCount }} / 豁免{{ row.exemptCount }} / 驳回{{ row.rejectedCount }}</div>
+            <div class="muted">待{{ row.pendingCount }} / 全免{{ row.exemptCount }}<template v-if="row.partialCount"> / 分责{{ row.partialCount }}</template> / 驳回{{ row.rejectedCount }}</div>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="120">
@@ -136,10 +136,27 @@
               <el-table-column label="签到时间" width="160">
                 <template #default="{row}">{{ row.boardedAt ? new Date(row.boardedAt).toLocaleString('zh-CN') : '—' }}</template>
               </el-table-column>
-              <el-table-column label="签到类型" width="100">
+              <el-table-column label="签到类型" width="110">
                 <template #default="{row}">
                   <el-tag size="small" :type="row.status==='late'?'warning':'success'">
-                    {{ row.status==='late'?'迟到上车':row.status==='changed'?'临时改站':'正常签到' }}
+                    {{ row.status==='late'?'发车后补签到':row.status==='changed'?'临时改站':'正常签到' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="事故公共晚点" width="110">
+                <template #default="{row}">{{ row.commonLateMinutes || 0 }} 分</template>
+              </el-table-column>
+              <el-table-column label="个人到站迟到" width="110">
+                <template #default="{row}">
+                  <span :style="{color:row.personalLateMinutes?'#e6a23c':'',fontWeight:row.personalLateMinutes?700:400}">
+                    {{ row.personalLateMinutes || 0 }} 分
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="责任归属" min-width="200">
+                <template #default="{row}">
+                  <el-tag size="small" :type="row.personalLateMinutes?'warning':'success'">
+                    {{ row.responsibility }}
                   </el-tag>
                 </template>
               </el-table-column>
@@ -171,6 +188,8 @@
 
           <!-- 影响企业与班次 + 批量处理 -->
           <el-tab-pane :label="`影响企业/班次（${detail.items?.length||0}人）`" name="impact">
+            <el-alert type="info" :closable="false" style="margin-bottom:10px"
+              title="分责规则：道路事故只豁免车次公共晚点；发车后补签到等个人到站迟到继续按企业宽限/扣费结算，可发起申诉，不计入园区事故成本与司机/线路受影响人数。"/>
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
               <el-select v-model="scope.companyId" :disabled="role==='hr'" placeholder="企业" style="width:200px">
                 <el-option v-for="c in companyOptions" :key="c.companyId" :label="`${c.companyName}（${c.count}人）`" :value="c.companyId"/>
@@ -179,6 +198,9 @@
                 <el-option v-for="s in scopeScheduleOptions" :key="s" :label="detail.impactSummary?.companies?.find((x:any)=>x.scheduleId===s)?.scheduleName||('班次#'+s)" :value="s"/>
               </el-select>
               <el-tag type="danger" effect="plain">本批次待处理 {{ scopedPending.length }} 人</el-tag>
+              <el-tag v-if="scopedPartialPending" type="warning" effect="plain">
+                其中 {{ scopedPartialPending }} 人含个人到站迟到，将仅豁免事故部分
+              </el-tag>
               <div style="flex:1"></div>
               <el-button v-if="canHandle" type="success" :disabled="!scopedPending.length" @click="openBatch('confirm')">
                 批量确认豁免并回写考勤
@@ -198,16 +220,22 @@
               </el-table-column>
               <el-table-column prop="scheduleName" label="班次" width="110"/>
               <el-table-column prop="stationName" label="签到站点" width="100"/>
-              <el-table-column label="晚点/宽限" width="90">
-                <template #default="{row}">{{ row.lateMinutes }} / {{ row.graceMinutes }}分</template>
+              <el-table-column label="事故公共晚点" width="100">
+                <template #default="{row}">{{ row.commonLateMinutes || 0 }} 分</template>
+              </el-table-column>
+              <el-table-column label="个人到站迟到" width="110">
+                <template #default="{row}">
+                  <b :style="{color:row.personalLateMinutes?'#e6a23c':'#9ca3af'}">{{ row.personalLateMinutes || 0 }} 分</b>
+                  <span class="muted"> / 宽限{{ row.graceMinutes }}</span>
+                </template>
               </el-table-column>
               <el-table-column label="原补车费" width="80">
                 <template #default="{row}">¥{{ row.originalFee }}</template>
               </el-table-column>
-              <el-table-column label="回写状态" width="150">
+              <el-table-column label="回写状态" width="185">
                 <template #default="{row}">
-                  <el-tag size="small" :type="row.status==='exempt'?'success':row.status==='rejected'?'danger':'warning'">
-                    {{ row.status==='exempt'?'已豁免回写':row.status==='rejected'?'已驳回':'待处理' }}
+                  <el-tag size="small" :type="row.status==='exempt'?'success':row.status==='partial_exempt'?'warning':row.status==='rejected'?'danger':'warning'">
+                    {{ row.status==='exempt'?'整条豁免已回写':row.status==='partial_exempt'?'事故豁免·保留个人迟到':row.status==='rejected'?'已驳回':'待处理' }}
                   </el-tag>
                   <div class="muted" v-if="row.handlerName">{{ row.handlerName }} · {{ row.handledAt ? new Date(row.handledAt).toLocaleDateString() : '' }}</div>
                 </template>
@@ -225,7 +253,10 @@
                 </el-tag>
               </el-descriptions-item>
               <el-descriptions-item label="晚点/豁免人数">
-                {{ detail.review?.delayMinutes }}分 / {{ detail.review?.exemptedCount }}人
+                {{ detail.review?.delayMinutes }}分 ｜ 事故整条豁免 {{ detail.review?.exemptedCount || 0 }} 人
+                <el-tag v-if="detail.review?.partialExemptCount" size="small" type="warning" style="margin-left:6px">
+                  分责（保留个人迟到）{{ detail.review.partialExemptCount }} 人
+                </el-tag>
               </el-descriptions-item>
               <el-descriptions-item label="根因（与证明同源）" :span="2">{{ detail.review?.rootCause }}</el-descriptions-item>
             </el-descriptions>
@@ -244,7 +275,7 @@
     <!-- 批量确认/驳回 -->
     <el-dialog v-model="batchDlg" :title="batchAction==='confirm'?'批量确认豁免并回写':'批量驳回'" width="520px" append-to-body>
       <el-alert v-if="batchAction==='confirm'" type="success" :closable="false" style="margin-bottom:10px"
-        :title="`将对本企业/班次 ${batchCount} 名待处理员工：考勤状态改豁免、补车费清零并回写考勤系统；司机绩效同步复核、线路复盘联动更新。`"/>
+        :title="`将对本企业/班次 ${batchCount} 名待处理员工回写：事故公共晚点统一豁免、补车费相应取消；其中含个人到站迟到者仅豁免事故部分，个人迟到按企业宽限结算（保留申诉入口）。司机绩效、线路复盘同步联动。`"/>
       <el-alert v-else type="error" :closable="false" style="margin-bottom:10px"
         :title="`将驳回 ${batchCount} 名员工的豁免，员工将收到通知并可走申诉流程。`"/>
       <el-input v-model="batchNote" type="textarea" :rows="3"
@@ -326,6 +357,7 @@ const scopedItems = computed(() => (detail.value.items || []).filter((i: any) =>
   (!scope.value.companyId || i.companyId === scope.value.companyId)
   && (!scope.value.scheduleId || i.scheduleId === scope.value.scheduleId)));
 const scopedPending = computed(() => scopedItems.value.filter((i: any) => i.status === 'pending'));
+const scopedPartialPending = computed(() => scopedPending.value.filter((i: any) => (i.personalLateMinutes || 0) > 0).length);
 
 async function openDetail(row: any) { return openDetailById(row.id); }
 async function openDetailById(id: number) {

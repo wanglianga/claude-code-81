@@ -12,8 +12,14 @@
               {{ fmt(row.scheduledArrive) }} → <b>{{ fmt(row.actualArrive) || '—' }}</b>
             </template>
           </el-table-column>
-          <el-table-column label="迟到" width="80">
-            <template #default="{row}">{{ row.lateMinutes ? row.lateMinutes + '分' : '—' }}</template>
+          <el-table-column label="迟到" width="120">
+            <template #default="{row}">
+              <span v-if="row.lateMinutes">{{ row.lateMinutes }}分</span>
+              <span v-else>—</span>
+              <span v-if="row.commonLateMinutes || row.personalLateMinutes" class="muted" style="display:block;font-size:11px">
+                事故{{ row.commonLateMinutes || 0 }}/个人{{ row.personalLateMinutes || 0 }}
+              </span>
+            </template>
           </el-table-column>
           <el-table-column label="状态" width="90">
             <template #default="{row}"><el-tag size="small" :type="st(row.status).type">{{ st(row.status).label }}</el-tag></template>
@@ -55,12 +61,21 @@
           <el-table-column label="事发地点" width="150" show-overflow-tooltip>
             <template #default="{row}">{{ row.incidentLocation || '—' }}</template>
           </el-table-column>
+          <el-table-column label="晚点分钟" width="150">
+            <template #default="{row}">
+              <span>事故公共 <b>{{ row.item.commonLateMinutes || 0 }}</b></span>
+              <span style="margin-left:6px" :style="{color:row.item.personalLateMinutes?'#e6a23c':''}">
+                个人 <b>{{ row.item.personalLateMinutes || 0 }}</b>
+              </span>
+            </template>
+          </el-table-column>
           <el-table-column label="晚点" width="70">
             <template #default="{row}">{{ row.delayMinutes }}分</template>
           </el-table-column>
-          <el-table-column label="我的处理结果" width="150">
+          <el-table-column label="我的处理结果" width="170">
             <template #default="{row}">
-              <el-tag v-if="row.item.status==='exempt'" size="small" type="success">已豁免并回写考勤</el-tag>
+              <el-tag v-if="row.item.status==='exempt'" size="small" type="success">事故晚点整条豁免</el-tag>
+              <el-tag v-else-if="row.item.status==='partial_exempt'" size="small" type="warning">事故豁免·保留个人迟到</el-tag>
               <el-tag v-else-if="row.item.status==='rejected'" size="small" type="danger">未获豁免</el-tag>
               <el-tag v-else size="small" type="warning">待 HR 确认</el-tag>
               <div class="muted" v-if="row.item.handleNote">{{ row.item.handleNote }}</div>
@@ -119,6 +134,11 @@
           <el-descriptions-item label="日期">{{ cert.date }}</el-descriptions-item>
           <el-descriptions-item label="线路/班次">{{ cert.impactSummary?.lineName }} · {{ cert.impactSummary?.scheduleName }}</el-descriptions-item>
           <el-descriptions-item label="晚点时长">{{ cert.delayMinutes }} 分钟</el-descriptions-item>
+          <el-descriptions-item label="晚点构成" :span="2">
+            事故公共晚点 <b>{{ cert.item?.commonLateMinutes || 0 }}</b> 分钟（证明豁免）
+            ｜ 个人到站迟到
+            <b :style="{color:cert.item?.personalLateMinutes?'#e6a23c':''}">{{ cert.item?.personalLateMinutes || 0 }}</b> 分钟（不随事故豁免）
+          </el-descriptions-item>
           <el-descriptions-item label="影响企业与班次" :span="2">
             <el-tag v-for="c in (cert.impactSummary?.companies||[])" :key="c.companyId" size="small" effect="plain" style="margin:2px">
               {{ c.companyName }} · {{ c.scheduleName }} · {{ c.count }}人
@@ -142,8 +162,14 @@
         </el-table>
 
         <el-alert style="margin-top:10px" :closable="false"
-          :type="cert.item?.status==='exempt'?'success':cert.item?.status==='rejected'?'error':'warning'"
-          :title="`我的考勤：${cert.item?.status==='exempt'?'已按本证明豁免并回写，补车费已取消':cert.item?.status==='rejected'?'本证明未覆盖/未获豁免，可发起申诉':'等待企业 HR 批量确认'}`"/>
+          :type="cert.item?.status==='exempt'?'success':cert.item?.status==='partial_exempt'?'warning':cert.item?.status==='rejected'?'error':'warning'"
+          :title="cert.item?.status==='exempt'
+            ? '我的考勤：事故晚点已整条豁免并回写，补车费已取消'
+            : cert.item?.status==='partial_exempt'
+              ? `我的考勤：事故公共晚点 ${cert.item.commonLateMinutes} 分钟已豁免；个人到站迟到 ${cert.item.personalLateMinutes} 分钟按企业规则结算，如有异议可发起申诉`
+              : cert.item?.status==='rejected'
+                ? '我的考勤：本证明未覆盖/未获豁免，可发起申诉'
+                : '我的考勤：等待企业 HR 批量确认'"/>
       </div>
     </el-dialog>
   </div>

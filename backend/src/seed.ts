@@ -164,14 +164,13 @@ async function main() {
   const histRecs: any[] = [];
   for (let i = 0; i < histEmps.length; i++) {
     const e = histEmps[i];
-    const late = i === 2; // 第3人额外个人迟到
-    const minutes = 30 + (late ? 15 : 0);
     const rec = await aRepo.save(aRepo.create({
       date: yesterday, employeeId: e.id, companyId: e.companyId, tripId: histTrip.id,
-      scheduledArrive: plannedArrive, actualArrive: new Date(`${yesterday}T08:${25 + (late ? 5 : 0)}:00Z`),
-      lateMinutes: minutes, status: 'late', lateReason: i === 0 ? 'congestion' : 'late_arrival',
-      exempt: false, makeupFee: late ? 30 : 20,
-      feeReason: `班车晚点30分钟${late ? '且个人到站点迟到' : ''}`,
+      scheduledArrive: plannedArrive, actualArrive: new Date(`${yesterday}T08:25:00Z`),
+      lateMinutes: 30, commonLateMinutes: 30, personalLateMinutes: 0,
+      status: 'late', lateReason: i === 0 ? 'congestion' : 'late_arrival',
+      exempt: false, makeupFee: 20,
+      feeReason: '班车因道路事故晚点30分钟',
     }));
     histRecs.push(rec);
     if (i === 0) {
@@ -248,7 +247,8 @@ async function main() {
       scheduleId: sMorning.id, attendanceId: histRecs[i].id,
       stationName: ['滨河家园', '东湖路口', '市民中心'][i],
       boardedAt: new Date(`${yesterday}T07:${12 + i}:00Z`),
-      lateMinutes: histRecs[i].lateMinutes, graceMinutes: 10,
+      lateMinutes: histRecs[i].lateMinutes, commonLateMinutes: 30, personalLateMinutes: 0,
+      graceMinutes: 10,
       originalFee: histRecs[i].makeupFee, status: 'pending', writeback: false,
     }));
   }
@@ -289,8 +289,9 @@ async function main() {
     companyConfirmations: [], employeeConfirmations: [],
   }));
 
-  // ---------- 昨日西线真实事故晚点车次（GPS 晚点25分/已签到/有事故留痕，尚未生成证明，供出证验收） ----------
+  // ---------- 昨日西线真实事故晚点车次（GPS 晚点25分；含1名发车后补签到员工=公共25+个人15=40分；尚未出证） ----------
   const westAccEmps = [emps[1], emps[2], emps[4]]; // 徐静、王敏（华星）；钱多多（瑞丰）
+  const westPersonalIdx = 1; // 王敏：发车后才赶到补签到，个人到站迟到 15 分钟
   const westTrip: any = await tripRepo.save(tripRepo.create({
     date: yesterday, scheduleId: sWestMorning.id, vehicleId: v2.id, driverId: d2.id,
     status: 'arrived', plannedDepart: '07:25',
@@ -307,17 +308,28 @@ async function main() {
   const westStationIds = [westStations[0].id, westStations[1].id, westStations[2].id];
   for (let i = 0; i < westAccEmps.length; i++) {
     const e = westAccEmps[i];
+    const isPersonal = i === westPersonalIdx;
+    const personal = isPersonal ? 15 : 0;
     await rRepo.save(rRepo.create({
       date: yesterday, employeeId: e.id, companyId: e.companyId,
       scheduleId: sWestMorning.id, stationId: westStationIds[i], tripId: westTrip.id,
-      status: 'boarded', seatNo: i + 1, boardedAt: new Date(`${yesterday}T07:${26 + i * 2}:00Z`),
+      // 王敏发车（07:30）后 07:35 才补签到 → late；其余正常签到 boarded
+      status: isPersonal ? 'late' : 'boarded', seatNo: i + 1,
+      boardedAt: isPersonal
+        ? new Date(`${yesterday}T07:35:00Z`)
+        : new Date(`${yesterday}T07:${26 + i * 2}:00Z`),
+      changeNote: isPersonal ? '发车后补签到，按个人到站迟到处理' : undefined,
     }));
+    const totalLate = 25 + personal;
     await aRepo.save(aRepo.create({
       date: yesterday, employeeId: e.id, companyId: e.companyId, tripId: westTrip.id,
       scheduledArrive: westPlannedArrive, actualArrive: westTrip.actualArrive,
-      lateMinutes: 25, status: 'late', lateReason: 'congestion', exempt: false,
+      lateMinutes: totalLate, commonLateMinutes: 25, personalLateMinutes: personal,
+      status: 'late', lateReason: isPersonal ? 'personal' : 'congestion', exempt: false,
       makeupFee: e.companyId === c2.id ? 30 : 20,
-      feeReason: '西线班车因道路事故晚点25分钟，超企业宽限',
+      feeReason: isPersonal
+        ? `西线事故公共晚点25分钟 + 个人发车后补签到15分钟，共40分钟`
+        : '西线班车因道路事故晚点25分钟，超企业宽限',
     }));
   }
   // 可追溯外部事件：同车次道路事故留痕（司机上报）

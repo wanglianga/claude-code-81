@@ -466,7 +466,7 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   check('无证明则 HR 无法批量豁免（404）',
     (await req('POST', '/late-certificates/999999/batch-confirm', {}, tHr)).status === 404);
 
-  // 14b. 真实事故晚点车次（昨日西线，GPS晚点25分/3人签到/同车事故留痕事件）正常出证
+  // 14b. 真实事故晚点车次（昨日西线，GPS晚点25分；华星王敏发车后补签到=公共25+个人15=40分）正常出证
   const genAccident = await req('POST', '/late-certificates/generate', {
     tripId: westTrip0.id, reasonType: 'accident',
   }, tDis);
@@ -474,6 +474,15 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     ok(genAccident) && genAccident.json.certNo && genAccident.json.delayMinutes === 25
     && genAccident.json.impactSummary.totalEmployees === 3
     && genAccident.json.impactSummary.companies.length === 2, genAccident.json);
+  // 取证已区分公共/个人分钟：王敏 25+15，其余 25+0
+  const westEvd = genAccident.json;
+  void westEvd;
+  const westDetail0 = (await req('GET', `/late-certificates/${genAccident.json.id}`, null, tHr)).json;
+  const wWang = westDetail0.items.find(i => i.employee?.employeeNo === 'HX1003');
+  check('取证区分公共晚点与个人迟到（王敏 25/15，共40）',
+    wWang.commonLateMinutes === 25 && wWang.personalLateMinutes === 15 && wWang.lateMinutes === 40, wWang);
+  check('正常签到员工无个人分钟（徐静 25/0）',
+    westDetail0.items.find(i => i.employee?.employeeNo === 'HX1002')?.personalLateMinutes === 0, westDetail0.items);
   const westCertId = genAccident.json.id;
   const dupGen = await req('POST', '/late-certificates/generate', { tripId: westTrip0.id, reasonType: 'accident' }, tDis);
   check('同一车次重复生成证明被拒', dupGen.status === 400, dupGen.json);
@@ -487,31 +496,61 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   void cWl;
 
   const cfHx2 = await req('POST', `/late-certificates/${westCertId}/batch-confirm`, { companyId: cHx }, tHr);
-  check('西线·华星批次确认 2 人，证明部分处理',
-    ok(cfHx2) && cfHx2.json.processed === 2 && cfHx2.json.status === 'partially_confirmed', cfHx2.json);
+  check('西线·华星批次确认 2 人：1整条豁免 + 1部分豁免（保留个人迟到）',
+    ok(cfHx2) && cfHx2.json.processed === 2 && cfHx2.json.fullExempt === 1
+    && cfHx2.json.partialExempt === 1 && cfHx2.json.status === 'partially_confirmed', cfHx2.json);
   const cfCross2 = await req('POST', `/late-certificates/${westCertId}/batch-confirm`, { companyId: cHx }, tHr2);
   check('瑞丰 HR 越权处理华星批次被拒(403)', cfCross2.status === 403, cfCross2.status);
   const cfRf2 = await req('POST', `/late-certificates/${westCertId}/batch-confirm`, { companyId: cRf }, tHr2);
-  check('西线·瑞丰批次确认 1 人后证明整体 confirmed',
-    ok(cfRf2) && cfRf2.json.processed === 1 && cfRf2.json.status === 'confirmed', cfRf2.json);
+  check('西线·瑞丰批次确认 1 人后证明整体 confirmed（累计整条豁免2/分责1）',
+    ok(cfRf2) && cfRf2.json.processed === 1 && cfRf2.json.fullExempt === 2
+    && cfRf2.json.partialExempt === 1 && cfRf2.json.status === 'confirmed', cfRf2.json);
 
-  const westAtt = (await req('GET', `/attendance?date=${yesterday}`, null, tOp)).json
+  const westAttAll = (await req('GET', `/attendance?date=${yesterday}`, null, tOp)).json
     .filter(a => a.certificateId === westCertId);
-  check('真实事故批次回写考勤：3 条豁免、费用清零',
-    westAtt.length === 3 && westAtt.every(a => a.status === 'exempt' && a.makeupFee === 0 && a.exempt === true),
-    westAtt.map(a => ({ s: a.status, fee: a.makeupFee })));
+  const wangAtt = westAttAll.find(a => a.employee?.employeeNo === 'HX1003');
+  const xuAtt = westAttAll.find(a => a.employee?.employeeNo === 'HX1002');
+  check('王敏：事故25分已豁免，保留15分个人迟到、计迟到并按华星规则扣费',
+    wangAtt.status === 'late' && wangAtt.exempt === false
+    && wangAtt.commonLateMinutes === 25 && wangAtt.personalLateMinutes === 15
+    && wangAtt.makeupFee === 20 && wangAtt.lateReason === 'personal'
+    && /个人到站迟到/.test(wangAtt.exemptReason || ''), wangAtt);
+  check('徐静/钱多多：无个人责任，整条豁免、补车费清零',
+    xuAtt.status === 'exempt' && xuAtt.makeupFee === 0
+    && westAttAll.filter(a => a.employee?.employeeNo === 'RF2002')[0]?.status === 'exempt'
+    && westAttAll.filter(a => a.employee?.employeeNo === 'RF2002')[0]?.makeupFee === 0,
+    westAttAll.map(a => ({ no: a.employee?.employeeNo, s: a.status, fee: a.makeupFee })));
+  check('事故实际豁免人数不被个人迟到虚增：3条记录中仅2条整条豁免',
+    westAttAll.filter(a => a.status === 'exempt').length === 2
+    && westAttAll.filter(a => a.status === 'late').length === 1, westAttAll.map(a => a.status));
+
+  // 王敏员工端：证明分责可见，且个人迟到记录仍可发起申诉
+  const tEmpWang = await login('emp_wang');
+  const wangMyCert = (await req('GET', '/my/late-certificates', null, tEmpWang)).json.find(c => c.id === westCertId);
+  check('王敏员工端显示事故豁免·保留个人迟到（25/15）',
+    wangMyCert.item.status === 'partial_exempt' && wangMyCert.item.commonLateMinutes === 25
+    && wangMyCert.item.personalLateMinutes === 15 && wangMyCert.item.writeback === true, wangMyCert?.item);
+  check('王敏与 HR 看到同一晚点原因（道路事故）', wangMyCert.reasonText === westDetail0.reasonText, wangMyCert?.reasonText);
+  const wangAppeal = await req('POST', '/appeals', {
+    attendanceId: wangAtt.id, reason: '不认可个人迟到15分钟，当时站点拥堵非个人原因（E2E）', evidence: '站点监控',
+  }, tEmpWang);
+  check('保留个人迟到的员工仍可发起申诉', ok(wangAppeal) && wangAppeal.json.id, wangAppeal.json);
+
   const westHrView = (await req('GET', `/late-certificates/${westCertId}`, null, tHr2)).json;
   const westEmpView = (await req('GET', '/my/late-certificates', null, tEmp2)).json.find(c => c.id === westCertId);
   check('西线证明员工端与 HR 端晚点原因一致（道路交通事故）',
     !!westEmpView && westEmpView.reasonText === westHrView.reasonText && /道路交通事故/.test(westEmpView.reasonText),
     { emp: westEmpView?.reasonText, hr: westHrView?.reasonText });
   const westPerf = (await req('GET', '/performances', null, tDrv2)).json.find(p => p.tripId === westTrip0.id);
-  check('driver02 绩效随真实事故证明撤销晚点扣分',
-    westPerf.safetyScore === 100 && westPerf.penalty === 0 && westPerf.certificateId === westCertId, westPerf);
+  check('driver02 绩效：事故公共晚点撤销扣分，备注标明个人迟到不纳入事故影响',
+    westPerf.safetyScore === 100 && westPerf.penalty === 0 && westPerf.certificateId === westCertId
+    && /个人到站迟到/.test(westPerf.note || ''), westPerf);
   const westReview = (await req('GET', '/line-reviews', null, tOp)).json.find(r => r.certificateId === westCertId);
-  check('西线事故证明联动线路复盘（已复盘/豁免3人/整改措施）',
-    !!westReview && westReview.status === 'reviewed' && westReview.exemptedCount === 3
-    && /缓冲|监控|区间车/.test(westReview.measures || ''), westReview);
+  check('西线事故复盘：事故整条豁免2人、分责1人，整改措施含两类',
+    !!westReview && westReview.status === 'reviewed' && westReview.exemptedCount === 2
+    && westReview.partialExemptCount === 1
+    && /缓冲|监控|区间车/.test(westReview.measures || '')
+    && /个人到站迟到/.test(westReview.measures || ''), westReview);
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);

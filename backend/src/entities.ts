@@ -200,11 +200,16 @@ export class LateCertificateAffected {
   @Column({ nullable: true }) attendanceId: number;   // 回写的考勤档案
   @Column({ nullable: true }) stationName: string;    // 签到站点
   @Column({ type: 'timestamptz', nullable: true }) boardedAt: Date; // 站点签到时间
-  @Column({ default: 0 }) lateMinutes: number;
+  @Column({ default: 0 }) lateMinutes: number;       // 总晚点（公共+个人）
+  @Column({ default: 0 }) commonLateMinutes: number; // 车次公共晚点（事故/拥堵，可豁免）
+  @Column({ default: 0 }) personalLateMinutes: number;// 个人到站迟到（发车后补签到等，不豁免）
   @Column({ default: 0 }) graceMinutes: number;       // 企业宽限规则快照
   @Column({ default: 0 }) originalFee: number;        // 原补车费
-  // pending（待本企业HR处理）| exempt（已豁免回写）| rejected（HR驳回）
+  // pending（待本企业HR处理）| exempt（公共+个人均无责，整条豁免）
+  // | partial_exempt（事故公共晚点已豁免，保留个人迟到结算）| rejected（HR驳回）
   @Column({ default: 'pending' }) status: string;
+  // full（整条豁免）| partial（仅豁免事故公共晚点）| none（驳回）
+  @Column({ nullable: true }) resolution: string;
   @Column({ default: false }) writeback: boolean;     // 是否已回写考勤系统
   @Column({ nullable: true }) handledById: number;
   @Column({ type: 'timestamptz', nullable: true }) handledAt: Date;
@@ -225,7 +230,8 @@ export class LineReview {
   @Column({ type: 'text', nullable: true }) measures: string;  // 整改措施
   @Column({ default: 0 }) delayMinutes: number;
   @Column({ default: 0 }) affectedCount: number;
-  @Column({ default: 0 }) exemptedCount: number;
+  @Column({ default: 0 }) exemptedCount: number;      // 事故晚点整条豁免人数（无个人迟到）
+  @Column({ default: 0 }) partialExemptCount: number; // 事故部分豁免、仍保留个人迟到人数
   // open（待复盘）| reviewed（已复盘）
   @Column({ default: 'open' }) status: string;
   @Column({ nullable: true }) handledById: number;
@@ -246,9 +252,11 @@ export class AttendanceRecord {
   @Column({ type: 'timestamptz', nullable: true }) scheduledArrive: Date;
   @Column({ type: 'timestamptz', nullable: true }) actualArrive: Date;
   @Column({ default: 0 }) lateMinutes: number;
-  // normal | late | exempt | no_show
+  @Column({ default: 0 }) commonLateMinutes: number;  // 车次公共晚点（事故/拥堵）
+  @Column({ default: 0 }) personalLateMinutes: number;// 个人到站迟到（发车后补签到等）
+  // normal | late | exempt | partial_exempt | no_show
   @Column({ default: 'normal' }) status: string;
-  @Column({ nullable: true }) lateReason: string; // congestion|breakdown|construction|missed|detour|personal|overtime
+  @Column({ nullable: true }) lateReason: string; // congestion|breakdown|construction|missed|detour|personal|overtime|accident
   @Column({ default: false }) exempt: boolean;    // 考勤豁免
   @Column({ nullable: true }) exemptReason: string;
   @Column({ default: 0 }) makeupFee: number;      // 补车费用

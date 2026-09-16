@@ -140,6 +140,14 @@ export class CertificateService {
       const employeeIds = [...new Set(onboard.map(r => r.employeeId))];
       const empUsers = await manager.getRepository(User).find({ where: { id: In(employeeIds) } });
 
+      // 逐人拆分：车次公共晚点（GPS 事实，事故可豁免）与个人到站迟到（发车后补签到等，不豁免）
+      const splitOf = (r: any) => {
+        const rec = recs.find(x => x.employeeId === r.employeeId && x.tripId === trip.id);
+        const personal = rec?.personalLateMinutes ?? (r.status === 'late' ? 15 : 0);
+        const common = rec?.commonLateMinutes ?? delay;
+        return { common, personal, total: common + personal, rec: rec || null };
+      };
+
       const rules = companies.map(c => {
         const rs = onboard.filter(r => r.companyId === c.id);
         const rr = recs.filter(x => x.companyId === c.id);
@@ -148,15 +156,21 @@ export class CertificateService {
           graceMinutes: c.lateGraceMinutes, shiftStart: c.dayShiftStart, lateFeeBase: c.lateFeeBase,
           affectedCount: rs.length,
           overGraceCount: rr.filter(x => (x.lateMinutes || 0) > c.lateGraceMinutes).length,
+          // 事故公共晚点豁免后，仅个人迟到仍超过企业宽限的人数（这部分不免除）
+          personalOverGraceCount: rs.filter(r => splitOf(r).personal > c.lateGraceMinutes).length,
         };
       });
 
       const checkins = onboard.map(r => {
         const u = empUsers.find(x => x.id === r.employeeId);
         const st = stations.find(s => s.id === (r.boardedStationId || r.stationId));
+        const sp = splitOf(r);
         return {
           employeeId: r.employeeId, employeeNo: u?.employeeNo, employeeName: u?.realName,
           companyId: r.companyId, station: st?.name, boardedAt: r.boardedAt, status: r.status,
+          commonLateMinutes: sp.common, personalLateMinutes: sp.personal,
+          personalLate: sp.personal > 0,
+          responsibility: sp.personal > 0 ? '事故公共晚点 + 个人到站迟到（分责）' : '事故公共晚点（全员共担）',
         };
       });
 
@@ -179,11 +193,16 @@ export class CertificateService {
       const impactCompanies = companies.map(c => {
         const rs = onboard.filter(r => r.companyId === c.id);
         const rr = recs.filter(x => x.companyId === c.id);
+        // 扣除事故公共晚点后，仍需个人担责的人数（个人迟到超宽限）
+        const personalHeld = rs.filter(r => splitOf(r).personal > c.lateGraceMinutes).length;
         return {
           companyId: c.id, companyName: c.name,
           scheduleId: sched.id, scheduleName: sched.name, shiftLabel: sched.shiftLabel,
           count: rs.length,
           overGraceCount: rr.filter(x => (x.lateMinutes || 0) > c.lateGraceMinutes).length,
+          fullExemptCount: rs.length - personalHeld,   // 事故晚点整条豁免
+          partialExemptCount: personalHeld,           // 豁免公共部分、保留个人迟到
+          commonLateMinutes: delay,
           feeTotal: rr.reduce((s, x) => s + (x.makeupFee || 0), 0),
         };
       });
@@ -212,22 +231,21 @@ export class CertificateService {
         }),
       );
 
-      // 影响名单：按企业 × 班次展开（批量处理的最小粒度）
+      // 影响名单：按企业 × 班次展开（批量处理的最小粒度），逐人记录两类晚点分钟
       for (const r of onboard) {
-        const u = empUsers.find(x => x.id === r.employeeId);
         const c = companies.find(x => x.id === r.companyId);
-        const rec = recs.find(x => x.employeeId === r.employeeId && x.tripId === trip.id);
         const st = stations.find(s => s.id === (r.boardedStationId || r.stationId));
+        const sp = splitOf(r);
         await manager.getRepository(LateCertificateAffected).save(
           manager.getRepository(LateCertificateAffected).create({
             certificateId: cert.id, employeeId: r.employeeId, companyId: r.companyId,
-            scheduleId: sched.id, attendanceId: rec?.id ?? null,
+            scheduleId: sched.id, attendanceId: sp.rec?.id ?? null,
             stationName: st?.name || null, boardedAt: r.boardedAt,
-            lateMinutes: rec?.lateMinutes || 0, graceMinutes: c?.lateGraceMinutes ?? 10,
-            originalFee: rec?.makeupFee || 0, status: 'pending', writeback: false,
+            lateMinutes: sp.total, commonLateMinutes: sp.common, personalLateMinutes: sp.personal,
+            graceMinutes: c?.lateGraceMinutes ?? 10,
+            originalFee: sp.rec?.makeupFee || 0, status: 'pending', writeback: false,
           }),
         );
-        void u;
       }
 
       // 线路复盘单随证明一并建立，原因与证明同源
@@ -285,28 +303,30 @@ export class CertificateService {
     const list = await this.certs.find({ where, order: { id: 'DESC' }, take: 100 });
     const items = list.length
       ? await this.items.find({ where: { certificateId: In(list.map(c => c.id)) } }) : [];
-    let result = list.map(c => {
+    const result = list.map(c => {
       const its = items.filter(i => i.certificateId === c.id);
       return {
         ...c,
         affectedTotal: its.length,
         pendingCount: its.filter(i => i.status === 'pending').length,
         exemptCount: its.filter(i => i.status === 'exempt').length,
+        partialCount: its.filter(i => i.status === 'partial_exempt').length,
         rejectedCount: its.filter(i => i.status === 'rejected').length,
         companyIds: [...new Set(its.map(i => i.companyId))],
       };
     });
+    let result2 = result;
     // 企业 HR 只看涉及本企业的证明；司机只看本人车次；员工只看本人受影响的证明
     if (user.role === 'hr' && user.companyId) {
-      result = result.filter(c => c.companyIds.includes(Number(user.companyId)));
+      result2 = result.filter(c => c.companyIds.includes(Number(user.companyId)));
     } else if (user.role === 'driver') {
-      result = result.filter(c => c.driverId === user.userId);
+      result2 = result.filter(c => c.driverId === user.userId);
     } else if (user.role === 'employee') {
       const myItems = await this.items.find({ where: { employeeId: user.userId } });
       const myCertIds = new Set(myItems.map(i => i.certificateId));
-      result = result.filter(c => myCertIds.has(c.id));
+      result2 = result.filter(c => myCertIds.has(c.id));
     }
-    return result;
+    return result2;
   }
 
   async detail(id: number, user: any) {
@@ -377,33 +397,76 @@ export class CertificateService {
     const note = (dto.note || '').slice(0, 200);
     return this.runBatch(id, dto, user, async (manager, cert, targets) => {
       const attRepo = manager.getRepository(AttendanceRecord);
+      const companyCache = new Map<number, Company>();
       for (const it of targets) {
+        const company = companyCache.get(it.companyId)
+          || await manager.getRepository(Company).findOne({ where: { id: it.companyId } });
+        if (company) companyCache.set(it.companyId, company);
+        const grace = company?.lateGraceMinutes ?? it.graceMinutes;
+        const feeBase = company?.lateFeeBase ?? 20;
+        const common = it.commonLateMinutes || 0;   // 事故公共晚点（本次证明豁免）
+        const personal = it.personalLateMinutes || 0; // 个人到站迟到（不豁免）
+
         if (it.attendanceId) {
           const rec = await attRepo.findOne({ where: { id: it.attendanceId } });
           if (rec) {
-            // 回写考勤系统：豁免 + 清零补车费，晚点原因与证明同源（减少人工截图传递）
-            rec.status = 'exempt';
-            rec.exempt = true;
             rec.certificateId = cert.id;
-            rec.lateReason = cert.reasonType;
-            rec.exemptReason = `晚点证明 ${cert.certNo}：${cert.reasonText}`;
-            rec.makeupFee = 0;
-            rec.feeReason = `晚点证明 ${cert.certNo} 确认豁免，补车费取消`;
+            rec.commonLateMinutes = common;
+            rec.personalLateMinutes = personal;
+            if (personal === 0) {
+              // 无个人责任：整条豁免，费用清零
+              rec.status = 'exempt';
+              rec.exempt = true;
+              rec.lateReason = cert.reasonType;
+              rec.exemptReason = `晚点证明 ${cert.certNo}：${cert.reasonText}`;
+              rec.makeupFee = 0;
+              rec.feeReason = `晚点证明 ${cert.certNo} 确认事故晚点豁免，补车费取消`;
+            } else {
+              // 事故公共晚点部分豁免，个人到站迟到部分继续按企业宽限/扣费结算（保留申诉入口）
+              rec.exempt = false;
+              rec.lateReason = 'personal';
+              rec.exemptReason = `晚点证明 ${cert.certNo} 仅豁免事故公共晚点 ${common} 分钟；个人到站迟到 ${personal} 分钟不在事故豁免范围`;
+              if (personal > grace) {
+                rec.status = 'late';
+                rec.makeupFee = feeBase;
+                rec.feeReason = `事故公共晚点 ${common} 分钟已豁免；个人到站迟到 ${personal} 分钟超出企业宽限 ${grace} 分钟，计个人迟到`;
+              } else {
+                rec.status = 'normal';
+                rec.makeupFee = 0;
+                rec.feeReason = `事故公共晚点 ${common} 分钟已豁免；个人迟到 ${personal} 分钟在企业宽限 ${grace} 分钟内，不计迟到`;
+              }
+            }
             await attRepo.save(rec);
           }
         }
-        it.status = 'exempt';
+
+        if (personal === 0) {
+          it.status = 'exempt';
+          it.resolution = 'full';
+          it.handleNote = note || `HR 批量确认：事故晚点整条豁免（证明 ${cert.certNo}）`;
+          await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
+            userId: it.employeeId, title: '晚点考勤豁免已生效',
+            content: `晚点证明 ${cert.certNo} 已由 HR 确认：${cert.reasonText}。您 ${cert.date} 的考勤已豁免、补车费已取消。`,
+            category: 'success',
+          }));
+        } else {
+          it.status = 'partial_exempt';
+          it.resolution = 'partial';
+          const held = personal > grace;
+          it.handleNote = note
+            || `事故公共晚点 ${common} 分钟已豁免；个人到站迟到 ${personal} 分钟${held ? `超宽限 ${grace} 分钟，计个人迟到` : '在宽限内'}（证明 ${cert.certNo}）`;
+          await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
+            userId: it.employeeId, title: '晚点证明分责处理结果',
+            content: `晚点证明 ${cert.certNo} 已由 HR 确认：班车因事故公共晚点 ${common} 分钟已豁免；`
+              + `您发车后补签到形成的个人到站迟到 ${personal} 分钟不属于事故豁免范围，`
+              + (held ? `按企业规则计个人迟到并产生补车费，如有异议可在系统发起申诉。` : `在企业宽限 ${grace} 分钟内，不计迟到。`),
+            category: held ? 'warning' : 'success',
+          }));
+        }
         it.writeback = true;
         it.handledById = user.userId;
         it.handledAt = new Date();
-        it.handleNote = note || `HR 批量确认（证明 ${cert.certNo}）`;
         await manager.getRepository(LateCertificateAffected).save(it);
-
-        await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
-          userId: it.employeeId, title: '晚点考勤豁免已生效',
-          content: `晚点证明 ${cert.certNo} 已由 HR 确认：${cert.reasonText}。您 ${cert.date} 的考勤已豁免、补车费已取消。`,
-          category: 'success',
-        }));
       }
     }, note, 'confirm');
   }
@@ -476,26 +539,25 @@ export class CertificateService {
       const scheduleIds = [...new Set(targets.map(t => t.scheduleId))];
       await apply(manager, cert, targets);
 
-      // ---- 证明整体状态重算 ----
+      // ---- 证明整体状态重算（partial_exempt 也属已回写办结，不阻断闭环） ----
       const all = await manager.getRepository(LateCertificateAffected).find({ where: { certificateId: id } });
       const pending = all.filter(a => a.status === 'pending').length;
       const exemptN = all.filter(a => a.status === 'exempt').length;
+      const partialN = all.filter(a => a.status === 'partial_exempt').length;
       const rejectedN = all.filter(a => a.status === 'rejected').length;
-      if (pending === 0 && exemptN === all.length) {
-        cert.status = 'confirmed';
-        cert.confirmedAt = new Date();
-      } else if (pending === 0 && rejectedN === all.length) {
+      const handledN = exemptN + partialN; // 事故公共晚点已实际豁免/回写的人数
+      if (pending === 0 && rejectedN === all.length) {
         cert.status = 'rejected';
         cert.confirmedAt = new Date();
       } else if (pending === 0) {
-        cert.status = 'partially_confirmed';
+        cert.status = 'confirmed';
         cert.confirmedAt = new Date();
       } else {
         cert.status = 'partially_confirmed';
       }
       await manager.getRepository(LateCertificate).save(cert);
 
-      // ---- 司机绩效联动（本企业批次确认时只更新一次） ----
+      // ---- 司机绩效联动：撤销的是事故公共晚点的扣分；员工个人补签到不属司机责任也不虚增受影响人数 ----
       if (action === 'confirm' && cert.driverId && cert.tripId) {
         const perf = await manager.getRepository(DriverPerformance).findOne({
           where: { driverId: cert.driverId, tripId: cert.tripId },
@@ -505,24 +567,25 @@ export class CertificateService {
           if (perf.certificateId !== cert.id) {
             perf.certificateId = cert.id;
             const tag = external
-              ? `晚点证明 ${cert.certNo}：${cert.reasonText}，非司机责任，撤销晚点扣分`
+              ? `晚点证明 ${cert.certNo}：${cert.reasonText}，事故公共晚点 ${cert.delayMinutes} 分钟非司机责任，撤销晚点扣分；另有 ${partialN} 名员工个人到站迟到不纳入本次事故影响`
               : `晚点证明 ${cert.certNo}：${cert.reasonText}，晚点与车辆/司机相关，维持考核`;
             perf.note = `${perf.note || ''}｜${tag}`;
             if (external) { perf.safetyScore = 100; perf.penalty = 0; }
             await manager.getRepository(DriverPerformance).save(perf);
             await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
               userId: cert.driverId, title: '晚点证明已联动绩效复核',
-              content: `车次 #${cert.tripId} 的晚点证明已由 HR 批量确认：${external ? '非司机责任，晚点扣分已撤销' : '维持原考核'}。`,
+              content: `车次 #${cert.tripId} 的晚点证明已由 HR 批量确认：${external ? '事故公共晚点非司机责任，晚点扣分已撤销' : '维持原考核'}。`,
             }));
           }
         }
       }
 
-      // ---- 线路复盘联动 ----
+      // ---- 线路复盘联动：分别统计事故豁免人数与部分豁免（保留个人迟到）人数 ----
       if (cert.reviewId) {
         const review = await manager.getRepository(LineReview).findOne({ where: { id: cert.reviewId } });
         if (review) {
           review.exemptedCount = exemptN;
+          review.partialExemptCount = partialN;
           if (cert.status === 'confirmed') {
             review.status = 'reviewed';
             review.reviewedAt = new Date();
@@ -530,7 +593,8 @@ export class CertificateService {
             const buffer = Math.max(10, Math.round(cert.delayMinutes / 2));
             const autoMeasures = `1) ${cert.incidentLocation || '事发路段'} 纳入高峰重点监控，提前获取交警事故/管制信息；`
               + `2) 相关线路预留 ${buffer} 分钟缓冲，必要时提前发车/安排区间车；`
-              + `3) ${exemptN} 名受影响员工考勤统一豁免并回写，账单同步核销补车费。`;
+              + `3) ${exemptN} 名员工事故晚点整条豁免并回写、账单核销；`
+              + `${partialN ? `4) 另 ${partialN} 名员工保留个人到站迟到结算（不纳入园区事故成本），推送各企业加强准点到站提醒。` : ''}`;
             // HR 批量确认备注追加为处理意见，不覆盖平台自动整改措施
             review.measures = note
               ? `${review.measures && review.measures !== note ? review.measures : autoMeasures}\n【HR批量确认意见】${note}`
@@ -543,7 +607,7 @@ export class CertificateService {
       return {
         ok: true, certNo: cert.certNo, status: cert.status,
         processed: targets.length, companyIds, scheduleIds,
-        exemptTotal: exemptN, affectedTotal: all.length,
+        exemptTotal: handledN, fullExempt: exemptN, partialExempt: partialN, affectedTotal: all.length,
       };
     });
   }

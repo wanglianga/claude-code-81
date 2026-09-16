@@ -11,6 +11,7 @@
           <el-option label="正常" value="normal"/>
           <el-option label="迟到" value="late"/>
           <el-option label="豁免" value="exempt"/>
+          <el-option label="事故豁免·保留个人迟到" value="partial_exempt"/>
           <el-option label="未到" value="no_show"/>
         </el-select>
         <el-button @click="reset">重置</el-button>
@@ -33,9 +34,12 @@
             {{ fmt(row.scheduledArrive) }} → <b>{{ fmt(row.actualArrive) || '未到厂' }}</b>
           </template>
         </el-table-column>
-        <el-table-column label="迟到(分)" width="80">
+        <el-table-column label="迟到(分)" width="120">
           <template #default="{row}">
             <span :style="{color:row.lateMinutes>0?'#e6a23c':''}">{{ row.lateMinutes }}</span>
+            <span v-if="row.commonLateMinutes || row.personalLateMinutes" class="muted" style="display:block;font-size:11px">
+              事故{{ row.commonLateMinutes || 0 }}/个人{{ row.personalLateMinutes || 0 }}
+            </span>
           </template>
         </el-table-column>
         <el-table-column label="原因" width="100">

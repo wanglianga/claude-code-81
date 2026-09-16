@@ -504,14 +504,18 @@ export class BusinessService {
           `${trip.date} ${sched.name} 记录为未到，产生补车费 ${rec.makeupFee} 元，如有异议可在系统发起申诉。`, 'warning');
       } else {
         rec.actualArrive = now;
-        let late = trip.delayMinutes;
-        if (r.status === 'late') late += 15; // 个人到站点迟到
+        const personalLate = r.status === 'late' ? 15 : 0; // 个人到站点迟到（发车后补签到）
+        const commonLate = trip.delayMinutes;             // 车次公共晚点（事故/拥堵等）
+        const late = commonLate + personalLate;
+        rec.commonLateMinutes = commonLate;
+        rec.personalLateMinutes = personalLate;
         rec.lateMinutes = late;
-        rec.lateReason = trip.delayMinutes > 0 ? 'late_arrival' : (r.status === 'late' ? 'personal' : undefined);
+        rec.lateReason = commonLate > 0 ? 'late_arrival' : (personalLate > 0 ? 'personal' : undefined);
         if (exemptEvent) {
           rec.status = 'exempt'; rec.exempt = true;
           rec.exemptReason = `因${exemptEvent.type}事件豁免（${exemptEvent.description.slice(0, 40)}）`;
         } else {
+          // 无统一豁免时，按总晚点对企业宽限判定（个人迟到同样计入）
           rec.status = late > grace ? 'late' : 'normal';
           if (rec.status === 'late') {
             rec.makeupFee = company?.lateFeeBase ?? 20;

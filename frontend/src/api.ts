@@ -89,6 +89,7 @@ export const STATUS: Record<string, { label: string; type: string }> = {
   auto_generated: { label: '平台已生成', type: 'info' },
   pending_hr: { label: '待HR确认', type: 'danger' },
   partially_confirmed: { label: '部分企业已处理', type: 'warning' },
+  partial_exempt: { label: '事故豁免·保留个人迟到', type: 'warning' },
   reviewed: { label: '已复盘', type: 'success' },
 };
 
