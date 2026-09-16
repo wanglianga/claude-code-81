@@ -14,6 +14,18 @@
             </el-table-column>
           </el-table>
         </el-card>
+
+        <el-card v-if="suppBuses.length" class="card-soft" header="深夜加班补车任务" style="margin-top:12px">
+          <div v-for="b in suppBuses" :key="b.id" style="padding:8px 0;border-bottom:1px solid #f0f0f0">
+            <div><b>{{ b.busNo }}</b> <el-tag size="small" :type="busTag(b.status).type">{{ busTag(b.status).label }}</el-tag></div>
+            <div class="muted">{{ b.date }} {{ new Date(b.departAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) }} → {{ b.destination }}（{{ b.passengerCount }}人）</div>
+            <el-button v-if="b.status==='approved'" size="small" type="primary" @click="busDepart(b)">发车</el-button>
+            <el-button v-if="b.status==='departed'" size="small" type="success" @click="busComplete(b)">送达完成</el-button>
+            <el-tag v-if="b.restDueAt && ['completed','settled'].includes(b.status)" size="small" type="warning">
+              休息至 {{ new Date(b.restDueAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) }}
+            </el-tag>
+          </div>
+        </el-card>
       </el-col>
 
       <el-col :span="15" v-if="trip">
@@ -35,6 +47,40 @@
             <span class="flow-step" :class="{active:trip.status==='arrived'}">④到厂归档</span>
             <span v-if="trip.status==='suspended'" class="flow-step danger">已停运</span>
           </div>
+
+          <!-- 临时改站导航 -->
+          <el-card v-if="nav?.temporaryStops?.length" class="card-soft" style="margin-bottom:12px;border:1px solid #e6a23c">
+            <template #header><b>🧭 导航已变更 · 临时停靠点（防漏接点名）</b></template>
+            <el-alert v-for="(t,ti) in nav.temporaryStops" :key="ti" type="warning" :closable="false" style="margin-bottom:8px">
+              <template #title>
+                <div>原站 <el-tag size="small" type="danger">{{ t.origin.name }}</el-tag> 无法停靠（{{ t.reason }}），
+                  改停 <el-tag size="small" type="success">{{ t.temporary.name }}</el-tag></div>
+                <div class="muted" style="color:#7a5b12">安全上车点：{{ t.safePickupPoint }}｜步行约 {{ t.walkMeters }} 米｜{{ t.walkRoute }}</div>
+              </template>
+            </el-alert>
+            <el-table :data="nav.temporaryStops.flatMap((t:any)=>t.passengers.map((p:any)=>({...p,t})))" size="small" border>
+              <el-table-column label="乘客" min-width="130">
+                <template #default="{row}">{{ paxName(row.employeeId) }}</template>
+              </el-table-column>
+              <el-table-column label="应接站点" width="120">
+                <template #default="{row}">{{ stationName(row.pickupStationId) }}</template>
+              </el-table-column>
+              <el-table-column label="员工确认" width="110">
+                <template #default="{row}">
+                  <el-tag size="small" :type="row.confirmed?'success':row.declined?'danger':'warning'">
+                    {{ row.confirmed?'已确认':row.declined?'无法前往':'未确认' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="点名（原因/时间/确认留痕）" min-width="230">
+                <template #default="{row}">
+                  <el-button size="small" type="success" @click="roll(row,'on_board')">临停点已上车</el-button>
+                  <el-button size="small" type="danger" plain @click="roll(row,'refused_change')">拒改站未乘</el-button>
+                  <el-button size="small" type="warning" plain @click="roll(row,'no_show')">未到</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-card>
 
           <!-- ① 发车前确认 -->
           <div v-if="trip.status==='planned'" style="line-height:2">
@@ -139,8 +185,52 @@ const scanCode = ref('');
 const proxyDlg = ref(false);
 const proxy = ref({ reservationId: null as any, proxyNote: '' });
 const stations = ref<any[]>([]);
+const nav = ref<any>(null);
+const suppBuses = ref<any[]>([]);
 
 const boarded = computed(() => manifest.value.filter(r => ['boarded', 'late', 'changed'].includes(r.status)).length);
+
+function busTag(s: string) {
+  return ({
+    approved: { label: '已派车待发车', type: 'primary' }, departed: { label: '行驶中', type: 'warning' },
+    completed: { label: '已完成', type: 'success' }, settled: { label: '已月结', type: 'info' },
+  } as any)[s] || { label: s, type: 'info' };
+}
+function paxName(id: number) { return manifest.value.find(r => r.employeeId === id)?.employee?.realName || `员工#${id}`; }
+function stationName(id: number) { return stations.value.find(s => s.id === id)?.name || `站点#${id}`; }
+
+async function loadNav(tripId: number) {
+  try { const { data } = await api.get(`/driver/trips/${tripId}/navigation`); nav.value = data; }
+  catch { nav.value = null; }
+}
+async function roll(p: any, result: string) {
+  let reason = '';
+  if (result !== 'on_board') {
+    const r = await ElMessageBox.prompt('未上车原因（将保留点名记录并通知员工）', '司机点名', {
+      inputValue: result === 'refused_change' ? '员工未确认改站，未到临停点' : '临停点未等到该员工',
+    }).catch(() => null);
+    if (!r) return;
+    reason = r.value;
+  }
+  await api.post(`/driver/trips/${trip.value.id}/roll-call`, { reservationId: p.reservationId, result, reason });
+  ElMessage.success('点名已记录');
+  await open({ id: trip.value.id });
+}
+async function busDepart(b: any) {
+  await api.post(`/supplements/${b.id}/depart`);
+  ElMessage.success('补车已发车');
+  loadSuppBuses();
+}
+async function busComplete(b: any) {
+  await ElMessageBox.confirm('确认安全送达？将按实际工时重算费用并重置您的休息时间。', '完成补车', { type: 'success' });
+  const { data } = await api.post(`/supplements/${b.id}/complete`);
+  ElMessage.success(`完成，工时 ${data.driverWorkMinutes} 分钟`);
+  loadSuppBuses();
+}
+async function loadSuppBuses() {
+  const { data } = await api.get('/driver/supplements');
+  suppBuses.value = data;
+}
 
 async function loadTrips() {
   const { data } = await api.get('/driver/trips');
@@ -156,6 +246,7 @@ async function open(t: any) {
   const { data: lines } = await api.get('/lines');
   const line = lines.find((l: any) => l.id === sLine);
   stations.value = line?.stationList || [];
+  loadNav(t.id);
 }
 async function confirm() {
   await api.post(`/driver/trips/${trip.value.id}/confirm`, { vehicleCheck: 'ok', routeOk: true });
@@ -218,5 +309,5 @@ async function submitProxy() {
   await board(row, { proxy: true, proxyNote: proxy.value.proxyNote });
   proxyDlg.value = false;
 }
-onMounted(loadTrips);
+onMounted(() => { loadTrips(); loadSuppBuses(); });
 </script>

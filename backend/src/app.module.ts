@@ -5,6 +5,8 @@ import * as entities from './entities';
 import { AuthModule } from './auth/auth.module';
 import { BusinessModule } from './business/business.module';
 import { CertificateModule } from './certificates/certificates.module';
+import { RelocationModule } from './relocations/relocations.module';
+import { SupplementModule } from './supplements/supplements.module';
 import { HealthController } from './health.controller';
 
 const allEntities = Object.values(entities);
@@ -30,6 +32,8 @@ const allEntities = Object.values(entities);
     AuthModule,
     BusinessModule,
     CertificateModule,
+    RelocationModule,
+    SupplementModule,
   ],
   controllers: [HealthController],
 })

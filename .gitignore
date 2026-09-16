@@ -16,6 +16,11 @@ coverage/
 *.tmp
 *.db
 *.sqlite
+*.pem
+*.key
+*secret*
+*token*
+*credential*
 uploads/
 
 # Local agent and QA artifacts

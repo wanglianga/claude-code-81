@@ -57,6 +57,8 @@ async function main() {
 
   const d1 = await mk({ username: 'driver01', realName: '马建国', role: 'driver', phone: '13800000001', licenseNo: 'A1-20031', safetyTrainingExpiry: '2027-06-30' });
   const d2 = await mk({ username: 'driver02', realName: '刘安全', role: 'driver', phone: '13800000002', licenseNo: 'A1-20055', safetyTrainingExpiry: '2026-12-31' });
+  // 当日已跑长途（约260分钟）的司机，用于加班补车工时上限校验
+  const d4 = await mk({ username: 'driver04', realName: '陈长途', role: 'driver', phone: '13800000004', licenseNo: 'A1-20188', safetyTrainingExpiry: '2027-03-31' });
   // 安全培训过期司机（用于排班拦截演示）
   await mk({ username: 'driver03', realName: '张过期', role: 'driver', phone: '13800000003', licenseNo: 'A1-20099', safetyTrainingExpiry: '2025-01-01' });
 
@@ -186,6 +188,19 @@ async function main() {
   await ds.getRepository(E.DriverPerformance).save(ds.getRepository(E.DriverPerformance).create({
     driverId: d1.id, tripId: histTrip.id, date: yesterday,
     safetyScore: 70, bonus: 0, penalty: 0, note: '晚点30分钟（道路拥堵）',
+  }));
+
+  // ---------- 今日 driver04 长途接驳（已到厂，驾驶约260分钟，用于加班补车工时上限校验） ----------
+  await tripRepo.save(tripRepo.create({
+    date: today, scheduleId: sNight.id, vehicleId: v2.id, driverId: d4.id,
+    status: 'arrived', plannedDepart: '19:00',
+    actualDepart: new Date(`${today}T18:00:00Z`),
+    actualArrive: new Date(`${today}T22:20:00Z`),
+    delayMinutes: 0, boardedCount: 1, noShowCount: 0, emptySeats: 44,
+    qrToken: crypto.randomBytes(8).toString('hex'),
+  }));
+  await ds.getRepository(E.DriverPerformance).save(ds.getRepository(E.DriverPerformance).create({
+    driverId: d4.id, date: today, safetyScore: 100, bonus: 0, penalty: 0, note: '长途接驳260分钟，接近工时上限',
   }));
 
   // ---------- 昨日未处理事件（调度/运营待办） ----------
@@ -343,6 +358,83 @@ async function main() {
     driverId: d2.id, tripId: westTrip.id, date: yesterday,
     safetyScore: 75, bonus: 0, penalty: 0, note: '晚点25分钟（道路事故，待证明核验）',
   }));
+
+  // ---------- 明日站点施工临时改站（员工待确认） ----------
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const tomR = await rRepo.save(rRepo.create({
+    date: tomorrow, employeeId: emps[2].id, companyId: c1.id,
+    scheduleId: sMorning.id, stationId: eastStations[2].id, status: 'booked',
+  }));
+  const reloRepo = ds.getRepository(E.StationRelocation);
+  const cfRepo = ds.getRepository(E.RelocationConfirmation);
+  const demoRelo = await reloRepo.save(reloRepo.create({
+    date: tomorrow, scheduleId: sMorning.id,
+    originalStationId: eastStations[2].id, temporaryStationId: eastStations[3].id, lineId: l1.id,
+    safePickupPoint: '科技大桥北引桥公交港湾（有照明、非机动车隔离）',
+    walkMeters: 320,
+    walkRoute: '由市民中心沿人行道步行约320米至科技大桥北引桥，途经1处信号灯控人行横道',
+    reason: '市政道路施工，市民中心站公交港湾封闭',
+    affectedCount: 1, status: 'proposed', createdById: dispatcher.id, createdByRole: 'dispatcher',
+  }));
+  tomR.relocationId = demoRelo.id; tomR.originalStationId = eastStations[2].id;
+  await rRepo.save(tomR);
+  await cfRepo.save(cfRepo.create({
+    relocationId: demoRelo.id, reservationId: tomR.id, employeeId: emps[2].id, status: 'pending',
+  }));
+  await ds.getRepository(E.Notification).save(ds.getRepository(E.Notification).create({
+    userId: emps[2].id, title: '临时改站通知（请确认）',
+    content: `${tomorrow} 市民中心站因施工无法停靠，临时上车点改为科技大桥（步行约320米），请在 App 内确认。`,
+    category: 'critical',
+  }));
+
+  // ---------- 加班补车：本月待派 1 单 + 上月已月结 1 单 ----------
+  const supRepo = ds.getRepository(E.SupplementBus);
+  const supPaxRepo = ds.getRepository(E.SupplementPassenger);
+  const billRepo = ds.getRepository(E.MonthlyBilling);
+  const feeOf = (pax: number, mins: number) => {
+    const vehicleFee = 120;
+    const driverOvertimeFee = Math.round(mins / 60 * 80);
+    const perPassengerFee = pax * 10;
+    const totalFee = vehicleFee + driverOvertimeFee + perPassengerFee;
+    const parkSubsidy = Math.round(totalFee * 0.2);
+    return { vehicleFee, driverOvertimeFee, perPassengerFee, totalFee, parkSubsidy, companyShare: totalFee - parkSubsidy, workMinutes: mins, perPerson: 10 };
+  };
+  await supRepo.save(supRepo.create({
+    busNo: `BC-${today.replace(/-/g, '')}-0001`, date: today, companyId: c1.id, createdById: hr1.id,
+    departAt: new Date(`${today}T23:00:00`), destination: '滨河家园片区（东线沿途）',
+    passengerCount: 3, reason: '华星产线赶单，临时加班至23时', status: 'pending',
+    feeSplit: feeOf(3, 45), totalFee: feeOf(3, 45).totalFee, driverWorkMinutes: 45,
+  }));
+
+  const d = new Date(Date.now() - 40 * 86400000);
+  const lastMonthDate = d.toISOString().slice(0, 10);
+  const lastPeriod = lastMonthDate.slice(0, 7);
+  const lastFee = feeOf(2, 50);
+  const lastBilling = await billRepo.save(billRepo.create({
+    period: lastPeriod, status: 'confirmed', totalAmount: lastFee.totalFee, supplementCount: 1,
+    companyBreakdown: [{
+      companyId: c2.id, companyName: c2.name, supplementCount: 1, passengerCount: 2, driverWorkMinutes: 50,
+      vehicleFee: lastFee.vehicleFee, driverOvertimeFee: lastFee.driverOvertimeFee,
+      perPassengerFee: lastFee.perPassengerFee, companyShare: lastFee.companyShare, parkSubsidy: lastFee.parkSubsidy,
+      total: lastFee.totalFee, busNos: [],
+    }],
+    confirmedById: operator.id, confirmedAt: new Date(),
+  }));
+  const lastBus = await supRepo.save(supRepo.create({
+    busNo: `BC-${lastMonthDate.replace(/-/g, '')}-0002`, date: lastMonthDate, companyId: c2.id,
+    createdById: hr2.id, departAt: new Date(`${lastMonthDate}T22:40:00`),
+    actualDepartAt: new Date(`${lastMonthDate}T22:40:00`), actualArriveAt: new Date(`${lastMonthDate}T23:30:00`),
+    destination: '瑞丰夜班宿舍区', passengerCount: 2, reason: '瑞丰月度盘点加班',
+    vehicleId: v1.id, driverId: d2.id, status: 'settled', reviewedById: dispatcher.id,
+    feeSplit: lastFee, totalFee: lastFee.totalFee, driverWorkMinutes: 50,
+    restReset: true, restDueAt: new Date(`${lastMonthDate}T23:50:00`), billingId: lastBilling.id,
+  }));
+  for (const eid of [emps[3].id, emps[4].id]) {
+    await supPaxRepo.save(supPaxRepo.create({
+      supplementBusId: lastBus.id, employeeId: eid, companyId: c2.id,
+      status: 'boarded', boardedAt: new Date(`${lastMonthDate}T22:40:00`),
+    }));
+  }
 
   console.log('Seed finished. Accounts (password: Pass1234):');
   console.log('  admin / operator / dispatcher');

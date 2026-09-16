@@ -13,6 +13,10 @@
         <el-menu-item v-if="role==='driver'" index="/driver"><el-icon><Van/></el-icon><span>司机控制台</span></el-menu-item>
         <el-menu-item v-if="['dispatcher','operator','admin'].includes(role)" index="/dispatch">
           <el-icon><Coordinate/></el-icon><span>调度派车</span></el-menu-item>
+        <el-menu-item v-if="['dispatcher','operator','admin'].includes(role)" index="/relocations">
+          <el-icon><MapLocation/></el-icon><span>施工临时改站</span></el-menu-item>
+        <el-menu-item v-if="['hr','dispatcher','operator','admin','driver'].includes(role)" index="/supplements">
+          <el-icon><Sunny/></el-icon><span>加班补车/月结</span></el-menu-item>
         <el-menu-item index="/events"><el-icon><Warning/></el-icon><span>途中事件协同</span>
           <el-badge v-if="openEvents>0" :value="openEvents" class="badge-dot"/></el-menu-item>
         <el-menu-item v-if="['hr','operator','admin','dispatcher'].includes(role)" index="/attendance">

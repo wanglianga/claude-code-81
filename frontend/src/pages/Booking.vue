@@ -1,6 +1,37 @@
 <template>
   <div>
     <h2 class="page-title">班车预约</h2>
+    <!-- 临时改站确认 -->
+    <el-card v-if="relos.length" class="card-soft" style="margin-bottom:14px;border:1px solid #f56c6c">
+      <template #header><b style="color:#f56c6c">⚠️ 您有 {{ relos.length }} 条站点施工临时改站待确认</b></template>
+      <el-table :data="relos" size="small">
+        <el-table-column label="日期" prop="date" width="105"/>
+        <el-table-column label="原站点 → 临停点" min-width="200">
+          <template #default="{row}">
+            <el-tag type="danger" size="small">{{ row.relocation.originalStationName }}</el-tag>
+            → <el-tag type="success" size="small">{{ row.relocation.temporaryStationName }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="安全上车点 / 步行" min-width="220">
+          <template #default="{row}">
+            <div>{{ row.relocation.safePickupPoint }}</div>
+            <div class="muted">步行约 {{ row.relocation.walkMeters }} 米：{{ row.relocation.walkRoute }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="确认" width="200">
+          <template #default="{row}">
+            <template v-if="row.status==='pending'">
+              <el-button type="success" size="small" @click="confirmRelo(row,true)">已知晓，前往临停点</el-button>
+              <el-button type="danger" size="small" plain @click="declineRelo(row)">无法前往</el-button>
+            </template>
+            <el-tag v-else size="small" :type="row.status==='accepted'?'success':'danger'">
+              {{ row.status==='accepted'?'已确认前往':'已反馈无法前往' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <el-card class="card-soft" style="margin-bottom:14px">
       <div style="display:flex;gap:12px;align-items:center">
         <span>乘车日期：</span>
@@ -94,6 +125,22 @@ const cur = ref<any>(null);
 const curStation = ref<any>(null);
 const form = ref({ withLuggage: false, tempOvertime: false, overtimeNote: '' });
 const holidayNote = ref('');
+const relos = ref<any[]>([]);
+
+async function loadRelos() {
+  const { data } = await api.get('/my/relocations');
+  relos.value = data;
+}
+async function confirmRelo(row: any, accept: boolean, note?: string) {
+  await api.post(`/relocations/${row.relocationId}/confirm`, { accept, note });
+  ElMessage.success(accept ? '已确认，乘车名单与司机导航已更新' : '已反馈');
+  loadRelos(); load();
+}
+async function declineRelo(row: any) {
+  const { value } = await ElMessageBox.prompt('无法前往临停点的原因（将进入司机点名与分流）', '反馈', { type: 'warning' }).catch(() => ({ value: null }));
+  if (value === undefined) return;
+  confirmRelo(row, false, value || '无法前往');
+}
 
 function availableStations(s: any) { return s.stations || []; }
 function disabledFuture(d: Date) { return d.getTime() < Date.now() - 86400000; }
@@ -106,6 +153,7 @@ async function load() {
   ]);
   list.value = data;
   mine.value = my;
+  loadRelos();
   const h = holidays.find((x: any) => x.date === date.value);
   holidayNote.value = h ? `${h.name}（${h.type === 'suspended' ? '停运' : h.type === 'holiday' ? '节假日' : '调休上班'}）` : '';
 }

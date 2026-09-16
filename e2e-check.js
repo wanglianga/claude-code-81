@@ -552,6 +552,235 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     && /缓冲|监控|区间车/.test(westReview.measures || '')
     && /个人到站迟到/.test(westReview.measures || ''), westReview);
 
+  // 15. 站点施工临时改站
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const tEmpWang2 = await login('emp_wang');
+  const tEmpWu = await login('emp_wu');
+  const empAllList = (await req('GET', '/employees', null, tDis)).json;
+  const idLi = empAllList.find(e => e.employeeNo === 'HX1001').id;
+
+  // 15a. 临停推荐
+  const bvTom = (await req('GET', `/booking-view?date=${tomorrow}`, null, tEmp2)).json;
+  const morningTom = bvTom.find(s => s.name === '东线早班');
+  const stDonghu = morningTom.stations.find(s => s.name === '东湖路口');
+  const stShimin = morningTom.stations.find(s => s.name === '市民中心');
+  const stKeji = morningTom.stations.find(s => s.name === '科技大桥');
+  const rec = await req('GET', `/relocations/recommend?lineId=${morning.lineId}&stationId=${stDonghu.id}`, null, tDis);
+  check('临停推荐返回同线路可停靠站、步行距离与安全上车点',
+    ok(rec) && rec.json.length >= 2 && rec.json.every(r => r.walkMeters > 0 && r.safePickupPoint && r.walkRoute)
+    && rec.json[0].recommendScore >= rec.json[1].recommendScore, rec.json);
+
+  // 15b. 明日预约 + 调度发起改站，员工确认后名单同步
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stDonghu.id }, tEmp2); // 徐静
+  const relo1 = await req('POST', '/relocations', {
+    date: tomorrow, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: stDonghu.id, temporaryStationId: stShimin.id,
+    reason: '东湖路口市政施工（E2E）',
+  }, tDis);
+  check('调度发起临时改站并通知', ok(relo1) && relo1.json.affectedCount === 1
+    && relo1.json.temporaryStation.name === '市民中心' && relo1.json.walkMeters > 0, relo1.json);
+  const relo1Id = relo1.json.id;
+
+  const myReloXu = (await req('GET', '/my/relocations', null, tEmp2)).json;
+  const myR1 = myReloXu.find(r => r.relocationId === relo1Id);
+  check('徐静收到改站确认单（待确认，含步行/安全点）',
+    !!myR1 && myR1.status === 'pending' && myR1.relocation.safePickupPoint && myR1.relocation.walkMeters > 0, myR1);
+  const cf1 = await req('POST', `/relocations/${relo1Id}/confirm`, { accept: true }, tEmp2);
+  check('员工确认改站', ok(cf1) && cf1.json.confirmations[0].status === 'accepted', cf1.json);
+  const myResTom = (await req('GET', '/my/reservations', null, tEmp2)).json;
+  const xuTomRes = myResTom.find(r => r.date === tomorrow);
+  check('确认后乘车名单上车站点同步为临停点',
+    xuTomRes.stationId === stShimin.id && /施工临停改站/.test(xuTomRes.changeNote || ''),
+    { stationId: xuTomRes.stationId, temp: stShimin.id, note: xuTomRes.changeNote });
+  const cf1dup = await req('POST', `/relocations/${relo1Id}/confirm`, { accept: true }, tEmp2);
+  check('重复确认被拒', cf1dup.status === 400, cf1dup.status);
+  // 无关员工不能确认
+  const cfOutsider = await req('POST', `/relocations/${relo1Id}/confirm`, { accept: true }, tEmp);
+  check('非通知范围员工确认被拒(403)', cfOutsider.status === 403, cfOutsider.status);
+
+  // 15c. 员工无法前往 → declined，进入点名分流
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stKeji.id }, tEmp);
+  const relo2 = await req('POST', '/relocations', {
+    date: tomorrow, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: stKeji.id, temporaryStationId: stShimin.id, reason: '科技大桥施工（E2E）',
+  }, tDis);
+  const relo2Id = relo2.json.id;
+  const dec2 = await req('POST', `/relocations/${relo2Id}/confirm`, { accept: false, note: '绕行太远无法赶到' }, tEmp);
+  check('员工反馈无法前往（declined，名单保留分流备注）',
+    ok(dec2) && dec2.json.confirmations.find(c => c.employeeId === idLi).status === 'declined'
+    && /未确认改站/.test(dec2.json.confirmations.find(c => c.employeeId === idLi).reservation.changeNote || ''),
+    dec2.json.confirmations);
+
+  // 15d. 司机导航联动 + 点名留痕：为明日生成新车次，再对其改站
+  const navBefore = (await req('GET', `/driver/trips/${tripId}/navigation`, null, tDrv)).json;
+  check('无改站时司机导航正常', navBefore.tripId === tripId && Array.isArray(navBefore.temporaryStops), navBefore);
+
+  const stBinhe = morningTom.stations.find(s => s.name === '滨河家园');
+  const stDonghu2 = morningTom.stations.find(s => s.name === '东湖路口');
+  const tEmpSun = await login('emp_sun');
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe.id }, tEmpSun);
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe.id }, tEmpZhou);
+  const genTom = await req('POST', '/trips/generate', {
+    date: tomorrow, scheduleId: morning.id, driverId: drvInfo.find(d => d.username === 'driver02').id,
+  }, tDis);
+  const tomTripId = genTom.json.tripId;
+  check('明日车次名单生成（用于改站导航验证）', ok(genTom) && tomTripId, genTom.json);
+  // 指派给 driver02 便于非本车司机校验
+  const d2info = drvInfo.find(d => d.username === 'driver02');
+  await req('POST', `/trips/${tomTripId}/assign`, { driverId: d2info.id }, tDis);
+  const tDrvTom = await login('driver02');
+
+  const reloToday = await req('POST', '/relocations', {
+    date: tomorrow, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: stBinhe.id, temporaryStationId: stDonghu2.id,
+    reason: '滨河家园路口施工（E2E 导航联动）',
+  }, tDis);
+  check('明日车次改站发起（影响新车次2人）', ok(reloToday) && reloToday.json.affectedCount === 2, reloToday.json);
+  const reloTodayId = reloToday.json.id;
+  const navOther = await req('GET', `/driver/trips/${tomTripId}/navigation`, null, tDrv);
+  check('非本车司机查看导航被拒(403)', navOther.status === 403, navOther.status);
+  const nav = (await req('GET', `/driver/trips/${tomTripId}/navigation`, null, tDrvTom)).json;
+  const navEntry = nav.temporaryStops.find(s => s.origin.name === '滨河家园');
+  check('司机导航同步临停点/安全上车点/步行路线',
+    nav.temporaryStops.length >= 4 && navEntry.temporary.name === '东湖路口'
+    && navEntry.safePickupPoint && navEntry.walkMeters > 0
+    && navEntry.passengers.length === 2, { count: nav.temporaryStops.length, entry: navEntry });
+  check('未确认员工进入司机导航待点名', navEntry.unconfirmedCount === 2, navEntry);
+
+  const empAllList2 = (await req('GET', '/employees', null, tDis)).json;
+  const idSun2 = empAllList2.find(e => e.employeeNo === 'RF2003').id;
+  const idZhou2 = empAllList2.find(e => e.employeeNo === 'WL3001').id;
+  const sunPax = navEntry.passengers.find(p => p.employeeId === idSun2);
+  const zhouPax = navEntry.passengers.find(p => p.employeeId === idZhou2);
+  const rc1 = await req('POST', `/driver/trips/${tomTripId}/roll-call`, {
+    reservationId: sunPax.reservationId, result: 'on_board', stationTime: new Date().toISOString(),
+  }, tDrvTom);
+  check('司机点名：临停点已上车留痕（站点时间/处理司机）',
+    ok(rc1) && rc1.json.result === 'on_board' && !!rc1.json.stationTime, rc1.json);
+  // 周婷确认改站后再点名，employeeConfirmed 应为 true
+  await req('POST', `/relocations/${reloTodayId}/confirm`, { accept: true }, tEmpZhou);
+  const rc2 = await req('POST', `/driver/trips/${tomTripId}/roll-call`, {
+    reservationId: zhouPax.reservationId, result: 'refused_change', reason: '临停点未等到该员工（E2E）',
+    stationTime: new Date().toISOString(),
+  }, tDrvTom);
+  check('司机点名：保留未上车原因/站点时间/员工确认',
+    ok(rc2) && rc2.json.result === 'refused_change' && /临停点未等到/.test(rc2.json.reason)
+    && !!rc2.json.stationTime && rc2.json.employeeConfirmed === true, rc2.json);
+  const rcList = (await req('GET', `/driver/trips/${tomTripId}/roll-calls`, null, tDrvTom)).json;
+  check('点名记录可查（2条，含 on_board/refused_change）',
+    rcList.length === 2 && rcList.some(r => r.result === 'on_board') && rcList.some(r => r.result === 'refused_change'), rcList);
+  const rcBad = await req('POST', `/driver/trips/${tomTripId}/roll-call`, {
+    reservationId: sunPax.reservationId, result: 'invalid_result',
+  }, tDrvTom);
+  check('非法点名结果被拒', rcBad.status === 400, rcBad.status);
+  void tEmpWang2; void tEmpWu;
+
+  // 16. 企业加班补车 + 月结
+  const tonight = `${today}T23:30:00`;
+  const hxEmpIds = (await req('GET', '/employees?companyId=1', null, tHr)).json.map(e => e.id);
+  // HR 预检：车辆/费用
+  const pre = await req('POST', '/supplements/check', { date: today, passengerCount: 3 }, tHr);
+  check('补车资源预检返回建议车辆与费用拆分',
+    ok(pre) && pre.json.ok && pre.json.suggestedVehicleId && pre.json.estimatedFee.totalFee > 0
+    && pre.json.estimatedFee.companyShare + pre.json.estimatedFee.parkSubsidy === pre.json.estimatedFee.totalFee, pre.json);
+  const empApply = await req('POST', '/supplements', {
+    date: today, departAt: tonight, destination: '滨河家园', passengerCount: 1,
+  }, tEmp);
+  check('员工不能发起补车(403)', empApply.status === 403, empApply.status);
+
+  const supApply = await req('POST', '/supplements', {
+    date: today, departAt: tonight, destination: '滨河家园片区（东线沿途）', passengerCount: 3,
+    employeeIds: hxEmpIds.slice(0, 3), reason: '产线赶单加班至23时（E2E）',
+  }, tHr);
+  check('HR 补车申请成功（pending，含3名乘车人/费用拆分）',
+    ok(supApply) && supApply.json.status === 'pending' && /^BC-/.test(supApply.json.busNo)
+    && supApply.json.passengers.length === 3 && supApply.json.feeSplit.totalFee > 0, supApply.json);
+  const bus1 = supApply.json.id;
+  const hrPending = (await req('GET', '/supplements?status=pending', null, tHr)).json;
+  check('HR 可见本企业待审核补车（含种子单）', hrPending.some(b => b.id === bus1), hrPending.map(b => b.id));
+
+  const vehiclesNow = (await req('GET', '/vehicles', null, tDis)).json;
+  const availCar = vehiclesNow.find(v => v.seats >= 3 && v.status === 'available');
+  const driversNow = (await req('GET', '/drivers', null, tDis)).json;
+  const drv1 = driversNow.find(d => d.username === 'driver01');
+
+  const pre1 = await req('POST', '/supplements/check', {
+    date: today, passengerCount: 3, vehicleId: availCar.id, driverId: drv1.id,
+  }, tDis);
+  check('派单前车辆/司机工时/休息预检通过', ok(pre1) && pre1.json.ok, pre1.json);
+
+  const drvDispatch = await req('POST', `/supplements/${bus1}/dispatch`, { vehicleId: availCar.id, driverId: drv1.id }, tDrv);
+  check('司机不能自行派单(403)', drvDispatch.status === 403, drvDispatch.status);
+  const dispatch1 = await req('POST', `/supplements/${bus1}/dispatch`, { vehicleId: availCar.id, driverId: drv1.id }, tDis);
+  check('调度派单成功（approved，费用按企业/人数/工时拆分）',
+    ok(dispatch1) && dispatch1.json.status === 'approved' && dispatch1.json.vehicleId === availCar.id
+    && dispatch1.json.feeSplit.companyShare > 0 && dispatch1.json.feeSplit.parkSubsidy > 0
+    && dispatch1.json.feeSplit.companyShare + dispatch1.json.feeSplit.parkSubsidy === dispatch1.json.totalFee, dispatch1.json);
+  const dispatchDup = await req('POST', `/supplements/${bus1}/dispatch`, { vehicleId: availCar.id, driverId: drv1.id }, tDis);
+  check('重复派单被拒', dispatchDup.status === 400, dispatchDup.status);
+
+  // 过期培训司机派单被拒
+  const drvExpired = driversNow.find(d => d.username === 'driver03');
+  const applyExp = await req('POST', '/supplements', {
+    date: today, departAt: tonight, destination: 'x', passengerCount: 1, reason: 'E2E',
+  }, tHr);
+  const disExp = await req('POST', `/supplements/${applyExp.json.id}/dispatch`, { vehicleId: availCar.id, driverId: drvExpired.id }, tDis);
+  check('安全培训过期司机派补车被拒', disExp.status === 400 && /培训/.test(JSON.stringify(disExp.json)), disExp.json);
+
+  // 当日累计驾驶已 260 分钟的司机：预检告警+派单超 300 分钟上限拦截
+  const drvLong = driversNow.find(d => d.username === 'driver04');
+  const checkLong = await req('POST', '/supplements/check', {
+    date: today, passengerCount: 2, vehicleId: availCar.id, driverId: drvLong.id,
+  }, tDis);
+  check('补车预检识别司机当日累计工时并按上限拒绝',
+    !checkLong.json.ok && checkLong.json.driverWorkedMinutes === 260
+    && /超过 ?\d+ ?分钟上限|超过.*上限/.test(checkLong.json.errors.join('；')), checkLong.json);
+  const applyLong = await req('POST', '/supplements', {
+    date: today, departAt: tonight, destination: '长途宿舍', passengerCount: 2, reason: 'E2E 超时',
+  }, tHr);
+  const disLong = await req('POST', `/supplements/${applyLong.json.id}/dispatch`, { vehicleId: availCar.id, driverId: drvLong.id }, tDis);
+  check('连续驾驶将超时的司机派单被拒(400)', disLong.status === 400 && /上限/.test(JSON.stringify(disLong.json)), disLong.json);
+
+  // 发车：非指派司机被拒，指派司机可发车
+  const departOther = await req('POST', `/supplements/${bus1}/depart`, null, tDrv2);
+  check('非指派司机不能发补车(403)', departOther.status === 403, departOther.status);
+  const depart1 = await req('POST', `/supplements/${bus1}/depart`, null, tDrv);
+  check('补车发车', ok(depart1) && depart1.json.status === 'departed', depart1.json);
+  await new Promise(r => setTimeout(r, 1200)); // 产生实际工时
+  const complete1 = await req('POST', `/supplements/${bus1}/complete`, null, tDrv);
+  check('补车完成：实际工时/费用重算/乘车记录已上车',
+    ok(complete1) && complete1.json.status === 'completed' && complete1.json.driverWorkMinutes >= 15
+    && complete1.json.passengers.every(p => p.status === 'boarded')
+    && complete1.json.feeSplit.driverOvertimeFee >= 0, complete1.json);
+  check('完成后司机休息时间重新计算（restDueAt 在未来）',
+    complete1.json.restReset === true && new Date(complete1.json.restDueAt) > new Date(), complete1.json.restDueAt);
+
+  // 强制休息校验：立即给同一司机派第二单 → 拒绝；换司机可派
+  const apply2 = await req('POST', '/supplements', {
+    date: today, departAt: tonight, destination: '科技园', passengerCount: 1, reason: 'E2E 第二单',
+  }, tHr);
+  const disRest = await req('POST', `/supplements/${apply2.json.id}/dispatch`, { vehicleId: availCar.id, driverId: drv1.id }, tDis);
+  check('休息期内给同一司机连续派单被拒(400)', disRest.status === 400 && /休息/.test(JSON.stringify(disRest.json)), disRest.json);
+  const drv2 = driversNow.find(d => d.username === 'driver02');
+  const dispatch2 = await req('POST', `/supplements/${apply2.json.id}/dispatch`, { vehicleId: availCar.id, driverId: drv2.id }, tDis);
+  check('换班司机可派单（避免连续超时驾驶）', ok(dispatch2) && dispatch2.json.status === 'approved', dispatch2.json);
+
+  // 月度结算
+  const period = today.slice(0, 7);
+  const prevPreview = await req('GET', `/billings/preview?period=${period}`, null, tOp);
+  check('月结预览：按企业/人数/司机工时拆分',
+    ok(prevPreview) && prevPreview.json.pendingCount >= 1
+    && prevPreview.json.companyBreakdown.some(c => c.companyName.includes('华星') && c.driverWorkMinutes >= 15 && c.passengerCount >= 3)
+    && prevPreview.json.companyAmount + prevPreview.json.parkSubsidy === prevPreview.json.totalAmount, prevPreview.json);
+  const bill = await req('POST', `/billings/${period}/confirm`, null, tOp);
+  check('运营确认月度出账', ok(bill) && bill.json.status === 'confirmed' && bill.json.totalAmount > 0 && bill.json.supplementCount >= 1, bill.json);
+  const settledBus = (await req('GET', `/supplements/${bus1}`, null, tHr)).json;
+  check('补车完成后进入月结（settled + billingId）', settledBus.status === 'settled' && settledBus.billingId === bill.json.id, { s: settledBus.status, b: settledBus.billingId });
+  const billDup = await req('POST', `/billings/${period}/confirm`, null, tOp);
+  check('同一账期重复出账被拒', billDup.status === 400, billDup.status);
+  const hrNotis = (await req('GET', '/notifications', null, tHr)).json;
+  check('HR 收到月度账单通知', hrNotis.some(n => /月度账单/.test(n.title)), hrNotis.map(n => n.title));
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('脚本异常', e); process.exit(2); });

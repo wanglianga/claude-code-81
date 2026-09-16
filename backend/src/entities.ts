@@ -143,6 +143,8 @@ export class Reservation {
   @Column({ default: false }) proxyBoarded: boolean;   // 代刷标记
   @Column({ nullable: true }) proxyNote: string;
   @Column({ nullable: true }) changeNote: string;
+  @Column({ nullable: true }) originalStationId: number; // 临时改站前的原站点
+  @Column({ nullable: true }) relocationId: number;      // 关联临时改站单
   @CreateDateColumn() createdAt: Date;
   @UpdateDateColumn() updatedAt: Date;
 }
@@ -385,6 +387,125 @@ export class Holiday {
   @Column() type: string;
   @Column() name: string;
   @Column({ nullable: true }) note: string;
+}
+
+// ============ 站点施工临时改站 ============
+@Entity('station_relocations')
+export class StationRelocation {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ type: 'date' }) date: string;
+  @Column({ nullable: true }) scheduleId: number;   // 影响班次（null=当天该站全部班次）
+  @Column() originalStationId: number;
+  @Column() temporaryStationId: number;
+  @Column({ nullable: true }) lineId: number;
+  // 推荐临时站点信息（安全上车点、步行距离、步行路线）
+  @Column({ nullable: true }) safePickupPoint: string;
+  @Column({ default: 0 }) walkMeters: number;
+  @Column({ type: 'text', nullable: true }) walkRoute: string;
+  @Column({ type: 'text' }) reason: string;
+  @Column({ default: 0 }) affectedCount: number;
+  // proposed（已通知待员工确认）| confirmed（员工均已确认/可执行）| completed | cancelled
+  @Column({ default: 'proposed' }) status: string;
+  @Column() createdById: number;
+  @Column({ nullable: true }) createdByRole: string;
+  @Column({ type: 'timestamptz', nullable: true }) completedAt: Date;
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
+}
+
+// 员工对临时改站的确认
+@Entity('relocation_confirmations')
+export class RelocationConfirmation {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() relocationId: number;
+  @Column() reservationId: number;
+  @Column() employeeId: number;
+  // pending（待确认）| accepted（已知晓前往临停点）| declined（无法前往，需点名/分流）
+  @Column({ default: 'pending' }) status: string;
+  @Column({ type: 'timestamptz', nullable: true }) confirmedAt: Date;
+  @Column({ nullable: true }) note: string;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// 司机点名记录（改站后防止漏接）
+@Entity('roll_calls')
+export class RollCall {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() tripId: number;
+  @Column() employeeId: number;
+  @Column({ nullable: true }) reservationId: number;
+  @Column({ nullable: true }) relocationId: number;
+  @Column({ nullable: true }) stationId: number;      // 实际应接站点（临停点）
+  // on_board（已上车）| no_show | refused_change（拒绝改站未乘）| absent | resolved
+  @Column() result: string;
+  @Column({ type: 'text', nullable: true }) reason: string;   // 未上车原因
+  @Column({ type: 'timestamptz', nullable: true }) stationTime: Date; // 站点到达/点名时间
+  @Column({ default: false }) employeeConfirmed: boolean;      // 员工是否已确认改站
+  @Column({ nullable: true }) handledById: number;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// ============ 企业加班补车 ============
+@Entity('supplement_buses')
+export class SupplementBus {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() busNo: string;                  // 补车单号 BC-YYYYMMDD-####
+  @Column({ type: 'date' }) date: string;
+  @Column() companyId: number;
+  @Column() createdById: number;            // HR
+  @Column({ nullable: true }) scheduleId: number;
+  @Column({ type: 'timestamptz' }) departAt: Date;   // 计划发车（深夜）
+  @Column({ type: 'timestamptz', nullable: true }) actualDepartAt: Date;
+  @Column({ type: 'timestamptz', nullable: true }) actualArriveAt: Date;
+  @Column({ nullable: true }) lineId: number;
+  @Column({ nullable: true }) stationId: number;     // 上车点（园区/约定点）
+  @Column() destination: string;
+  @Column({ default: 1 }) passengerCount: number;
+  @Column({ type: 'text' }) reason: string;          // 加班说明
+  @Column({ nullable: true }) vehicleId: number;
+  @Column({ nullable: true }) driverId: number;
+  // pending（待调度审核）| approved（已派车）| rejected | departed | completed | settled
+  @Column({ default: 'pending' }) status: string;
+  @Column({ nullable: true }) reviewedById: number;
+  @Column({ type: 'text', nullable: true }) reviewNote: string;
+  // 费用拆分（企业承担/园区承担、司机工时费、里程/车辆费）
+  @Column({ type: 'jsonb', nullable: true }) feeSplit: any;
+  @Column({ default: 0 }) totalFee: number;
+  @Column({ default: 0 }) driverWorkMinutes: number;  // 司机本次工时（分钟）
+  @Column({ default: false }) restReset: boolean;     // 完成后已重算休息
+  @Column({ type: 'timestamptz', nullable: true }) restDueAt: Date; // 连续驾驶后强制休息至
+  @Column({ nullable: true }) billingId: number;      // 进入的月结核账单
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
+}
+
+// 补车乘车人（员工乘车记录进入月结）
+@Entity('supplement_passengers')
+export class SupplementPassenger {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() supplementBusId: number;
+  @Column() employeeId: number;
+  @Column() companyId: number;
+  // booked | boarded | no_show
+  @Column({ default: 'booked' }) status: string;
+  @Column({ type: 'timestamptz', nullable: true }) boardedAt: Date;
+  @CreateDateColumn() createdAt: Date;
+}
+
+// ============ 园区月度结算 ============
+@Entity('monthly_billings')
+export class MonthlyBilling {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ unique: true }) period: string;           // YYYY-MM
+  // draft（汇总中）| confirmed（已月结）
+  @Column({ default: 'draft' }) status: string;
+  @Column({ type: 'jsonb', nullable: true }) companyBreakdown: any; // 按企业/人数/工时拆分
+  @Column({ default: 0 }) totalAmount: number;
+  @Column({ default: 0 }) supplementCount: number;
+  @Column({ nullable: true }) confirmedById: number;
+  @Column({ type: 'timestamptz', nullable: true }) confirmedAt: Date;
+  @CreateDateColumn() createdAt: Date;
+  @UpdateDateColumn() updatedAt: Date;
 }
 
 // ============ 通知 ============
