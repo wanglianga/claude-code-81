@@ -882,7 +882,6 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     && genOpts.json.options.some(o => o.crossDistrict && o.addedFeePerMonth > 0)
     && genOpts.json.options[0].stations.every(s => s.walkMeters > 0 && s.arriveTime), genOpts.json.options?.map(o => o.name));
 
-  // 普通员工不能反馈，员工代表可以
   const fbNormal = await req('POST', `/line-relocations/${rlId}/feedback`, {
     optionId: genOpts.json.options[0].id, verdict: 'approved',
   }, tEmp2);
@@ -895,7 +894,6 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
   const hrSum = await req('POST', `/line-relocations/${rlId}/hr-summary`, { note: '新厂区两班倒，夜班接驳必须保留' }, tHr);
   check('HR 汇总企业排班要求', ok(hrSum) && /夜班/.test(hrSum.json.hrScheduleNote), hrSum.json);
 
-  // 形成正式方案：费用有争议时禁止锁定
   const directOpt = genOpts.json.options[0].id;
   const adjDispute = await req('POST', `/line-relocations/${rlId}/adjust`, {
     optionId: directOpt,
@@ -911,42 +909,97 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     ok(adjOk) && adjOk.json.costLocked === true && adjOk.json.capacityLocked === true
     && adjOk.json.status === 'adjusted' && adjOk.json.chosenOptionId === directOpt, adjOk.json);
 
-  // 顺序：企业先确认、代表再确认；代表不能先确认
   const repEarly = await req('POST', `/line-relocations/${rlId}/confirm-employee`, {}, tEmp);
   check('企业未确认前员工代表确认被拒', repEarly.status === 400, repEarly.status);
   const coConf = await req('POST', `/line-relocations/${rlId}/confirm-company`, {}, tHr);
   check('企业负责人确认', ok(coConf) && coConf.json.status === 'company_confirmed', coConf.json);
   const empConf = await req('POST', `/line-relocations/${rlId}/confirm-employee`, {}, tEmp);
-  check('员工代表确认 → 双确认通过', ok(empConf) && empConf.json.status === 'confirmed', empConf.json);
+  check('员工代表确认 → 双确认通过（新线已建但未到生效日）', ok(empConf) && empConf.json.status === 'confirmed' && empConf.json.newLineId, empConf.json);
+  const futureNewLineId = empConf.json.newLineId;
 
-  // 生效前员工过渡选择：退订
+  // —— 生效日前：新线不可约（用当日无东线预约的 emp_night，隔离同日同向唯一校验）——
+  const futureNewSched = (await req('GET', '/schedules', null, tOp)).json.find(s => s.lineId === futureNewLineId);
+  check('双确认即生成新线路/班次，openedFrom=生效日',
+    !!futureNewSched && (await req('GET', `/line-relocations/${rlId}`, null, tOp)).json.newLine.openedFrom === futureDate, futureNewSched);
+  const futureNewLineStations = (await req('GET', '/lines', null, tOp)).json.find(l => l.id === futureNewLineId).stationList;
+  const beforeOpenDate = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10); // 生效日前
+  const newEarlyBook = await req('POST', '/reservations', {
+    date: beforeOpenDate, scheduleId: futureNewSched.id, stationId: futureNewLineStations[0].id,
+  }, tNight);
+  check('生效日前新厂区专线不可预约（openedFrom 拦截）', newEarlyBook.status === 400 && /开放预约|生效日/.test(JSON.stringify(newEarlyBook.json)), newEarlyBook.json);
+  // 生效日当天新线开放（此时旧线仍冻结，二者不重叠）
+  const newOnDayBook = await req('POST', '/reservations', {
+    date: futureDate, scheduleId: futureNewSched.id, stationId: futureNewLineStations[0].id,
+  }, tNight);
+  check('生效日当天新厂区专线可预约', ok(newOnDayBook), newOnDayBook.json);
+  const earlyEff = await req('POST', `/line-relocations/${rlId}/effectuate`, {}, tOp);
+  check('未到生效日提前切换被拒', earlyEff.status === 400 && /生效日/.test(JSON.stringify(earlyEff.json)), earlyEff.json);
+
+  // 过渡退订：既有预约退订后释放，不重复占座/计费
   const preResId = preBook.json?.id;
   if (preResId) {
     const chRefund = await req('POST', `/line-relocations/${rlId}/choose`, { reservationId: preResId, choice: 'refund' }, tEmp2);
     check('过渡期员工可退订', ok(chRefund) && chRefund.json.choice === 'refund', chRefund);
+    const refundedRes = (await req('GET', '/my/reservations', null, tEmp2)).json.find(r => r.id === preResId);
+    check('退订后预约取消、释放座位', refundedRes.status === 'cancelled', refundedRes.status);
+    const refundAgain = await req('POST', `/line-relocations/${rlId}/choose`, { reservationId: preResId, choice: 'refund' }, tEmp2);
+    check('已退订不可重复操作', refundAgain.status === 400, refundAgain.status);
   }
 
-  // 生效：落地新线/班次/站点，旧站设停用日期，未选择员工继续旧站并提醒
-  const eff = await req('POST', `/line-relocations/${rlId}/effectuate`, {}, tOp);
-  check('生效：生成独立新线路与站点/班次，新线从生效日独立结算',
-    ok(eff) && eff.json.status === 'effective' && eff.json.newLineId
-    && eff.json.newLine.name.includes('滨湖智造园')
-    && eff.json.choices.length >= 1, eff.json);
-  const newLineId = eff.json.newLineId;
-  const newStations = (await req('GET', '/lines', null, tOp)).json;
-  const newLine = newStations.find(l => l.id === newLineId);
-  check('新线路已可查且为 active', !!newLine && newLine.status === 'active', newLine);
-  const oldStations = (await req('GET', '/lines', null, tOp)).json.find(l => l.id === eastLineId).stationList;
-  check('旧线路站点标记停用日期（搬迁停用）',
-    oldStations.every((s) => s.closedFrom === futureDate), oldStations.map((s) => s.closedFrom));
+  // —— 生效日当天（today）的重排单：用瑞丰西线 + 代表赵强，验证切换入口与同日同向唯一 ——
+  const westLineInfo = (await req('GET', '/lines', null, tOp)).json.find(l => l.code === 'L-WEST');
+  const westSchedInfo = (await req('GET', '/schedules', null, tOp)).json.find(s => s.lineId === westLineInfo.id && s.direction === 'to_park');
+  // 撤销种子中西线的恒信 consulting 演示单，释放线路互斥
+  const seedWestRl = (await req('GET', '/line-relocations', null, tOp)).json.find(r => r.oldLineId === westLineInfo.id && r.status === 'consulting');
+  if (seedWestRl) await req('POST', `/line-relocations/${seedWestRl.id}/cancel`, {}, tOp);
+  // tEmpZhao（赵强）即瑞丰员工代表，已在上方登录，今日西线无预约可干净验证
+  // 赵强今日在西线无预约，可干净验证新线可约
+  const rlToday = await req('POST', '/line-relocations', {
+    companyId: cRf, oldLineId: westLineInfo.id, newSiteName: '滨江智造港',
+    newSiteAddress: '滨江路1号', effectDate: today, transitionEnd: today,
+  }, tOp);
+  check('生效日重排单创建成功', ok(rlToday) && rlToday.json.id, rlToday.json);
+  if (ok(rlToday) && rlToday.json.id) {
+    const tid = rlToday.json.id;
+    await req('POST', `/line-relocations/${tid}/options`, {}, tOp);
+    const tOpts = (await req('GET', `/line-relocations/${tid}`, null, tOp)).json.options;
+    await req('POST', `/line-relocations/${tid}/adjust`, {
+      optionId: tOpts[0].id, costPlan: { companyShareRatio: 80, parkSubsidyRatio: 20, scheduleArrangement: '平移' },
+      effectDate: today, transitionEnd: today,
+    }, tOp);
+    await req('POST', `/line-relocations/${tid}/confirm-company`, {}, tHr2);
+    const tConf = await req('POST', `/line-relocations/${tid}/confirm-employee`, {}, tEmpZhao);
+    check('瑞丰代表双确认通过', ok(tConf) && tConf.json.status === 'confirmed' && tConf.json.newLineId, tConf.json);
+    const tEff = await req('POST', `/line-relocations/${tid}/effectuate`, {}, tOp);
+    check('生效日当天可执行切换', ok(tEff) && tEff.json.status === 'effective', tEff.json);
+    const todayNewLineId = tConf.json.newLineId;
+    const todayNewSched = (await req('GET', '/schedules', null, tOp)).json.find(s => s.lineId === todayNewLineId && s.direction === 'to_park');
+    const todayNewStations = (await req('GET', '/lines', null, tOp)).json.find(l => l.id === todayNewLineId).stationList;
+    // 赵强今日旧线已实际乘车完成（boarded），不构成重复占座；新线待乘预约允许
+    const bookNew = await req('POST', '/reservations', {
+      date: today, scheduleId: todayNewSched.id, stationId: todayNewStations[0].id,
+    }, tEmpZhao);
+    check('生效日后新厂区专线可预约（已完成旧线行程不重复占座）', ok(bookNew), bookNew.json);
+    // 同一员工再约一条待乘同向班次 → 被唯一约束拦截
+    const otherToPark2 = (await req('GET', '/schedules', null, tOp)).json
+      .find(s => s.lineId === todayNewLineId && s.direction === 'to_park' && s.id !== todayNewSched.id);
+    if (otherToPark2) {
+      const dupDir2 = await req('POST', '/reservations', {
+        date: today, scheduleId: otherToPark2.id, stationId: todayNewStations[0].id,
+      }, tEmpZhao);
+      check('同一员工同日同向仅一条待乘预约', dupDir2.status === 400 && /同方向/.test(JSON.stringify(dupDir2.json)), dupDir2.json);
+    }
+    // 旧西线生效日后拒绝新预约
+    const bookOldAfter = await req('POST', '/reservations', {
+      date: today, scheduleId: westSchedInfo.id, stationId: westLineInfo.stationList[0].id,
+    }, tEmpZhao);
+    check('生效日后旧站点拒绝新预约', bookOldAfter.status === 400 && /停用|新厂区/.test(JSON.stringify(bookOldAfter.json)), bookOldAfter.json);
+  }
 
-  // 历史档案仍按旧线保留：昨日事故/补车等记录不受影响
+  // 历史档案仍按旧线保留
   const oldAtt = (await req('GET', `/attendance?date=${yesterday}`, null, tHr)).json;
   check('旧线路历史考勤档案保留', oldAtt.length >= 3, oldAtt.length);
-
-  // 新线路从生效日起独立可预约（旧站停用日期后旧线不可约）
-  const newSched = (await req('GET', '/schedules', null, tOp)).json.find((s) => s.lineId === newLineId);
-  check('新线路已生成班次', !!newSched, newSched);
+  check('未来生效重排单生成的新线路存在', !!futureNewSched, !!futureNewSched);
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);

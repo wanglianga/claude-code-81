@@ -50,6 +50,13 @@ export class LineRelocationService {
     const oldLine = await this.lines.findOne({ where: { id: Number(dto.oldLineId) } });
     if (!oldLine) throw new NotFoundException('原线路不存在');
     const effectDate = dto.effectDate || new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
+    // 同一旧线只允许一张进行中（未生效/未撤销）的重排单，避免冻结/停用判定互相覆盖
+    const existing = await this.rls.findOne({
+      where: { oldLineId: Number(dto.oldLineId) },
+      order: { id: 'DESC' },
+    });
+    if (existing && !['effective', 'cancelled'].includes(existing.status))
+      throw new BadRequestException(`该线路已有进行中的重排单 ${existing.rlNo}（状态 ${existing.status}），请先完成或撤销，不能重复发起`);
 
     let rlId: number;
     await this.ds.transaction(async (manager) => {
@@ -303,7 +310,7 @@ export class LineRelocationService {
 
   // 5b) 员工代表确认 → 双确认通过
   async confirmEmployee(id: number, user: any) {
-    return this.ds.transaction(async (manager) => {
+    await this.ds.transaction(async (manager) => {
       const rl = await manager.getRepository(LineRelocation).findOne({ where: { id } });
       if (!rl) throw new NotFoundException('重排单不存在');
       const company = await manager.getRepository(Company).findOne({ where: { id: rl.companyId } });
@@ -313,20 +320,96 @@ export class LineRelocationService {
         throw new BadRequestException('需企业负责人先确认');
       rl.status = 'confirmed';
       await manager.getRepository(LineRelocation).save(rl);
-      await this.notifyRoles(manager, ['operator', 'dispatcher'], '搬迁线路双确认通过，可生效',
-        `${rl.rlNo}：企业负责人与员工代表均已确认，请在生效日执行切换。`);
-      await this.notifyRoles(manager, ['hr'], '搬迁线路双确认通过', `${rl.rlNo} 已具备生效条件。`, rl.companyId);
-      return rl;
+
+      // 双确认即落地新线路骨架（站点/班次），但 openedFrom=生效日：生效日前不接受该日预约
+      if (!rl.newLineId) {
+        const option = await manager.getRepository(LineRelocationOption).findOne({ where: { id: rl.chosenOptionId } });
+        if (option) {
+          const newLine = await this.buildNewLine(manager, rl, company, option);
+          rl.newLineId = newLine.id;
+          await manager.getRepository(LineRelocation).save(rl);
+        }
+      }
+      await this.notifyRoles(manager, ['operator', 'dispatcher'], '搬迁线路双确认通过',
+        `${rl.rlNo}：企业负责人与员工代表均已确认。新线路将于 ${rl.effectDate} 开放预约，旧线同日停用，请在生效日执行切换。`);
+      await this.notifyRoles(manager, ['hr'], '搬迁线路双确认通过',
+        `${rl.rlNo} 已确认，新线 ${rl.effectDate} 起接受预约，生效日前不可提前约新线。`, rl.companyId);
     });
+    return this.detail(id);
   }
 
-  // 6) 过渡期已预约员工选择：改站/改班次/退订/继续旧站
+  // 落地新线路（站点/班次）；openedFrom 之前预约接口拒绝
+  private async buildNewLine(manager: any, rl: LineRelocation, company: Company, option: LineRelocationOption) {
+    const newLine = await manager.getRepository(Line).save(manager.getRepository(Line).create({
+      code: `L-NEW-${rl.id}`, name: `${company.name}·${rl.newSiteName || '新厂区'}专线`,
+      district: option.crossDistrict ? '跨区' : '东区', baseFare: 0,
+      status: 'active', openedFrom: rl.effectDate,
+    }));
+    const optStations: any[] = option.stations || [];
+    for (let i = 0; i < optStations.length; i++) {
+      await manager.getRepository(Station).save(manager.getRepository(Station).create({
+        lineId: newLine.id, name: optStations[i].name, seq: i + 1,
+        district: option.crossDistrict ? '跨区' : '东区', capacity: 30, status: 'normal',
+      }));
+    }
+    for (const s of (rl.impact?.schedules || [])) {
+      await manager.getRepository(Schedule).save(manager.getRepository(Schedule).create({
+        lineId: newLine.id, name: s.name.replace(/东线|西线/, '新厂区专线'), direction: s.direction,
+        departureTime: s.departureTime, shiftLabel: s.shiftLabel, valid: true,
+      }));
+    }
+    return newLine;
+  }
+
+  // 6) 过渡期已预约员工选择：改站/改班次/退订/继续旧站；做容量与去重，避免重复占座/计费
   async choose(id: number, dto: any, user: any) {
-    return this.ds.transaction(async (manager) => {
+    await this.ds.transaction(async (manager) => {
       const rl = await manager.getRepository(LineRelocation).findOne({ where: { id } });
       if (!rl) throw new NotFoundException('重排单不存在');
       const res = await manager.getRepository(Reservation).findOne({ where: { id: Number(dto.reservationId) } });
       if (!res || res.employeeId !== user.userId) throw new ForbiddenException('非本人预约');
+      if (dto.choice === 'refund' && res.status === 'cancelled')
+        throw new BadRequestException('该预约已退订，请勿重复操作');
+
+      // 改站/改班的容量与同日同向去重校验
+      let targetScheduleId: number | null = null;
+      let targetStationId: number | null = null;
+      if (dto.choice === 'change_station') {
+        if (!dto.targetStationId) throw new BadRequestException('请选择目标站点');
+        targetStationId = Number(dto.targetStationId);
+        const targetStation = await manager.getRepository(Station).findOne({ where: { id: targetStationId } });
+        if (!targetStation) throw new BadRequestException('目标站点不存在');
+        const occ = await manager.getRepository(Reservation).count({
+          where: { date: res.date, scheduleId: res.scheduleId, stationId: targetStationId,
+            status: In(['booked', 'on_manifest', 'boarded', 'late', 'changed']) },
+        });
+        if (occ >= targetStation.capacity)
+          throw new BadRequestException(`目标站点「${targetStation.name}」该班次容量已满（${targetStation.capacity}人），请改选其它站点`);
+      } else if (dto.choice === 'change_schedule') {
+        if (!dto.targetScheduleId) throw new BadRequestException('请选择目标班次');
+        targetScheduleId = Number(dto.targetScheduleId);
+        const targetSched = await manager.getRepository(Schedule).findOne({ where: { id: targetScheduleId } });
+        if (!targetSched) throw new BadRequestException('目标班次不存在');
+        // 同日同向唯一（仅待乘状态）：目标班次不能与本人其它待乘预约撞车
+        const mine = await manager.getRepository(Reservation).find({
+          where: { date: res.date, employeeId: user.userId,
+            status: In(['booked', 'on_manifest']) },
+        });
+        const mySchedIds = [...new Set(mine.filter(m => m.id !== res.id).map(m => m.scheduleId))];
+        if (mySchedIds.length) {
+          const myScheds = await manager.getRepository(Schedule).find({ where: { id: In(mySchedIds) } });
+          if (myScheds.some(s => s.direction === targetSched.direction))
+            throw new BadRequestException('您当日已有同方向有效预约，改班会重复占座，请先退订原预约');
+        }
+        // 目标班次目标站（沿用本站）容量
+        const occ = await manager.getRepository(Reservation).count({
+          where: { date: res.date, scheduleId: targetScheduleId, stationId: res.stationId,
+            status: In(['booked', 'on_manifest', 'boarded', 'late', 'changed']) },
+        });
+        const st = await manager.getRepository(Station).findOne({ where: { id: res.stationId } });
+        if (st && occ >= st.capacity)
+          throw new BadRequestException('目标班次在该站点候车容量已满，请改选其它班次');
+      }
 
       let choice = await manager.getRepository(LineRelocationChoice).findOne({ where: { relocationId: id, reservationId: res.id } });
       if (!choice) {
@@ -334,28 +417,31 @@ export class LineRelocationService {
           relocationId: id, reservationId: res.id, employeeId: user.userId,
         });
       }
+      // 同一预约只允许一次最终选择（防止重复改占多个座位）
+      if (choice.decidedAt && choice.choice !== 'keep_old' && choice.choice !== dto.choice)
+        throw new BadRequestException('您已提交过过渡选择，不能重复改站/改班（请联系调度）');
+
       choice.choice = dto.choice;
-      choice.targetStationId = dto.targetStationId || null;
-      choice.targetScheduleId = dto.targetScheduleId || null;
+      choice.targetStationId = targetStationId;
+      choice.targetScheduleId = targetScheduleId;
       choice.decidedAt = new Date();
       await manager.getRepository(LineRelocationChoice).save(choice);
 
       if (dto.choice === 'refund') {
-        res.status = 'cancelled';
-        res.changeNote = `搬迁过渡：员工选择退订（${rl.rlNo}）`;
-        await manager.getRepository(Reservation).save(res);
-      } else if (dto.choice === 'change_station' && dto.targetStationId) {
-        res.originalStationId = res.originalStationId ?? res.stationId;
         await manager.createQueryBuilder().update(Reservation)
-          .set({ stationId: Number(dto.targetStationId), changeNote: `搬迁过渡改站（${rl.rlNo}）` })
+          .set({ status: 'cancelled', changeNote: `搬迁过渡：员工选择退订（${rl.rlNo}），释放座位不计费` })
           .where('id = :id', { id: res.id }).execute();
-      } else if (dto.choice === 'change_schedule' && dto.targetScheduleId) {
+      } else if (dto.choice === 'change_station' && targetStationId) {
         await manager.createQueryBuilder().update(Reservation)
-          .set({ scheduleId: Number(dto.targetScheduleId), changeNote: `搬迁过渡改班次（${rl.rlNo}）` })
+          .set({ stationId: targetStationId, changeNote: `搬迁过渡改站（${rl.rlNo}），原座位已释放` })
+          .where('id = :id', { id: res.id }).execute();
+      } else if (dto.choice === 'change_schedule' && targetScheduleId) {
+        await manager.createQueryBuilder().update(Reservation)
+          .set({ scheduleId: targetScheduleId, changeNote: `搬迁过渡改班次（${rl.rlNo}），原班次座位已释放` })
           .where('id = :id', { id: res.id }).execute();
       }
-      return choice;
     });
+    return this.choices.findOne({ where: { relocationId: id, reservationId: Number(dto.reservationId) } });
   }
 
   async myChoices(userId: number) {
@@ -365,41 +451,26 @@ export class LineRelocationService {
     return choices.map(c => ({ ...c, relocation: rls.find(r => r.id === c.relocationId) })).filter(x => x.relocation);
   }
 
-  // 7) 生效：落地新线路与站点、标记旧站点停用日期；未确认员工继续旧站并提醒
+  // 7) 生效切换：只能在生效日当天/之后执行；新线已在双确认时创建（openedFrom=生效日），
+  //    这里只停用旧站/旧线并处理未选择员工，避免生效日前提前切换造成双线双约
   async effectuate(id: number, user: any) {
     if (!['operator', 'admin'].includes(user.role)) throw new ForbiddenException('仅园区运营可执行生效');
+    const todayStr = new Date().toISOString().slice(0, 10);
     await this.ds.transaction(async (manager) => {
       const rl = await manager.getRepository(LineRelocation).findOne({ where: { id }, lock: { mode: 'pessimistic_write' } });
       if (!rl) throw new NotFoundException('重排单不存在');
+      if (rl.status === 'effective') throw new BadRequestException('该重排单已生效');
       if (rl.status !== 'confirmed') throw new BadRequestException('需企业负责人与员工代表双确认后才能生效');
-      const option = await manager.getRepository(LineRelocationOption).findOne({ where: { id: rl.chosenOptionId } });
+      if (todayStr < rl.effectDate)
+        throw new BadRequestException(`未到生效日 ${rl.effectDate}（今日 ${todayStr}），生效日前不得切换线路；新线将在生效日开放预约，旧线继续冻结新预约`);
       const company = await manager.getRepository(Company).findOne({ where: { id: rl.companyId } });
+      if (!rl.newLineId) throw new BadRequestException('新线路尚未生成');
+      const newLine = await manager.getRepository(Line).findOne({ where: { id: rl.newLineId } });
 
-      // 创建新线路（独立结算）
-      const newLine = await manager.getRepository(Line).save(manager.getRepository(Line).create({
-        code: `L-NEW-${rl.id}`, name: `${company.name}·${rl.newSiteName || '新厂区'}专线`,
-        district: option.crossDistrict ? '跨区' : '东区', baseFare: 0,
-        status: 'active',
-      }));
-      const optStations: any[] = option.stations || [];
-      for (let i = 0; i < optStations.length; i++) {
-        await manager.getRepository(Station).save(manager.getRepository(Station).create({
-          lineId: newLine.id, name: optStations[i].name, seq: i + 1,
-          district: option.crossDistrict ? '跨区' : '东区', capacity: 30, status: 'normal',
-        }));
-      }
-      // 复制班次
-      for (const s of (rl.impact?.schedules || [])) {
-        await manager.getRepository(Schedule).save(manager.getRepository(Schedule).create({
-          lineId: newLine.id, name: s.name.replace(/东线|西线/, '新厂区专线'), direction: s.direction,
-          departureTime: s.departureTime, shiftLabel: s.shiftLabel, valid: true,
-        }));
-      }
-
-      // 旧站点标记停用日期；旧线路在过渡期后停用
+      // 旧站点从生效日停用、旧线停用（预约接口按 effectDate/closedFrom 拒绝旧线新约）
       const oldStations = await manager.getRepository(Station).find({ where: { lineId: rl.oldLineId } });
       for (const st of oldStations) {
-        st.closedFrom = rl.transitionEnd;
+        st.closedFrom = rl.effectDate;
         st.closeReason = `${company.name} 搬迁，随旧线路停用（${rl.rlNo}）`;
         await manager.getRepository(Station).save(st);
       }
@@ -407,7 +478,7 @@ export class LineRelocationService {
       oldLine.status = 'suspended';
       await manager.getRepository(Line).save(oldLine);
 
-      // 未做选择的在乘员工：继续按旧站点乘过渡车并提醒，避免漏接
+      // 未做选择的在乘员工：继续旧站过渡并提醒，避免漏接
       const activeRes = await manager.getRepository(Reservation).find({
         where: { id: In((rl.impact?.reservations || []).map((r: any) => r.id)) },
       });
@@ -420,19 +491,18 @@ export class LineRelocationService {
             relocationId: id, reservationId: r.id, employeeId: r.employeeId, choice: 'keep_old', decidedAt: new Date(),
           }));
           await this.notify(manager, r.employeeId, '搬迁过渡：您仍按旧站点乘车',
-            `${rl.rlNo}：新线路将于 ${rl.effectDate} 生效，过渡期至 ${rl.transitionEnd} 您继续在原站点乘车，司机将按旧站点名，请留意不要漏接；可在 App 内改站/改班次/退订。`, 'critical');
+            `${rl.rlNo}：新线 ${rl.effectDate} 起开放，您继续在原站点乘过渡车，司机按旧站点名，请留意不要漏接；可在 App 内改站/改班次/退订。`, 'critical');
           keepCount++;
         }
       }
 
       rl.status = 'effective';
-      rl.newLineId = newLine.id;
       rl.effectiveById = user.userId;
       rl.effectiveAt = new Date();
       await manager.getRepository(LineRelocation).save(rl);
 
       await this.notifyRoles(manager, ['hr', 'operator', 'dispatcher'], '搬迁新线路已生效',
-        `${rl.rlNo}：新线路「${newLine.name}」自 ${rl.effectDate} 独立结算；旧线过渡至 ${rl.transitionEnd}，${keepCount} 名未选择员工继续旧站乘车并已提醒。门禁/考勤规则按新厂区匹配。`, rl.companyId);
+        `${rl.rlNo}：新线路「${newLine.name}」今日起开放预约并独立结算；旧线已停用，${keepCount} 名未选择员工继续旧站过渡并已提醒。门禁/考勤规则按新厂区匹配。`, rl.companyId);
     });
     return this.detail(id);
   }

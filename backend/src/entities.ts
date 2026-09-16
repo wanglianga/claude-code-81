@@ -46,6 +46,7 @@ export class Line {
   @Column({ default: '东区' }) district: string;
   // active | suspended | relocated
   @Column({ default: 'active' }) status: string;
+  @Column({ type: 'date', nullable: true }) openedFrom: string; // 搬迁新线：仅该日起接受预约
   @Column({ default: 45 }) baseFare: number; // 单趟基准费用（企业分摊用）
   @ManyToMany('Company')
   @JoinTable({ name: 'line_companies' })

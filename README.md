@@ -167,8 +167,9 @@ http://<宿主IP>:<CC_PUBLISH_PORT>/           # 例如 http://localhost:3081/
 | 园区不能直接切换；发 HR 与员工代表 | 候选仅进入 `consulting`，通知 HR 与企业 `representative`；普通员工反馈 403 |
 | 代表按站点/班次/步行/到厂反馈，HR 汇总排班 | `POST /:id/feedback`（verdict + 站点/班次/步行/到厂/意见）、`POST /:id/hr-summary` |
 | 先确认费用与班次、再锁定座位车辆 | `POST /:id/adjust`：先校验 `costPlan` 承担比例，**有 `disputeNote` 直接拒绝**；再按在乘人数匹配座位、校验司机工时（跨区+50 分钟，上限 300），不足拒绝；`costLocked/capacityLocked` 分别落库 |
-| 企业负责人 + 员工代表确认生效 | `confirm-company` → `company_confirmed` → 员工代表 `confirm-employee` → `confirmed`（代表提前确认 400）；运营 `effectuate` 才真正切换 |
-| 旧线过渡期、已预约改站/改班次/退订、未确认继续旧站并提醒 | `POST /:id/choose`（keep_old/change_station/change_schedule/refund）；生效时未选择员工自动记 `keep_old` 并 critical 提醒，继续旧站乘过渡车防漏接 |
+| 企业负责人 + 员工代表确认生效 | `confirm-company` → `company_confirmed` → 员工代表 `confirm-employee` → `confirmed`（代表提前确认 400）；**双确认时即生成新线骨架但 `openedFrom=effectDate`（生效日前不可约）**，运营只能在生效日当天/之后 `effectuate` 切换 |
+| 按 effectDate 分离确认/预约切换/旧线停用，防止双线双约 | 新线 `openedFrom` 之前预约接口拒绝；旧线在重排进行中冻结、生效日后旧站（closedFrom）拒新约；**同一员工同日同方向仅一条待乘预约**（已完成行程不冲突）；同一旧线只允许一张进行中重排单 |
+| 旧线过渡期、已预约改站/改班次/退订、未确认继续旧站并提醒 | `POST /:id/choose`（keep_old/change_station/change_schedule/refund）：改站/改班做目标容量与同日同向去重，同一预约最终选择只允许一次，退订释放座位且明确不计费；生效时未选择员工自动 keep_old 并 critical 提醒 |
 | 站点停用日期、司机端员工端同步、门禁考勤按新厂匹配 | 生效时旧站写 `closedFrom/closeReason`、旧线 suspended；新线路/站点/班次独立创建；前端预约对停用日期后的旧站拒绝 |
 | 旧线档案保留、新线生效日起独立结算 | 生效仅新建新线，不改动历史预约/考勤/补车/申诉；新线 `code=L-NEW-x`、独立班次与后续结算；旧线历史档案可查 |
 | 结果/意见/确认人/生效时间入园区档案 | 重排单保留 `feedbacks/choices/companyConfirmById/effectiveById/effectiveAt`，`GET /:id` 可回查 |
@@ -241,7 +242,7 @@ cd frontend && npm install && npx vite   # 已配置 /api 代理到 localhost:30
 
 验证方式以「宿主 `docker compose up -d` 健康检查通过 + 浏览器走通上述业务流」为准。
 
-仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 193 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、完整双确认矩阵、**Promise.all 并发 6 路确认与两个 operator 并发发布互斥**、访客门禁、停运通知，**晚点考勤豁免证明全链路**（出证可信核验、事故/个人迟到分责、跨企业批量回写、绩效/复盘/同源原因），**站点施工临时改站**（统一可停靠判定与容量硬约束、施工站零副作用、容量分流、未确认点名防漏接），**企业加班补车**（工时上限/强制休息、费用拆分、月结），以及**企业搬迁线路重排**（冻结预约、影响盘点、候选生成、代表/HR 反馈、费用先于运力锁定、企业+代表双确认、过渡选择、生效落地新线/旧站停用日期、历史档案保留与新线独立结算））：
+仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 201 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、完整双确认矩阵、**Promise.all 并发 6 路确认与两个 operator 并发发布互斥**、访客门禁、停运通知，**晚点考勤豁免证明全链路**（出证可信核验、事故/个人迟到分责、跨企业批量回写、绩效/复盘/同源原因），**站点施工临时改站**（统一可停靠判定与容量硬约束、施工站零副作用、容量分流、未确认点名防漏接），**企业加班补车**（工时上限/强制休息、费用拆分、月结），以及**企业搬迁线路重排**（冻结预约、影响盘点、候选生成、代表/HR 反馈、费用先于运力锁定、企业+代表双确认、**按 effectDate 分离：双确认时建 openedFrom 新线但生效日前不可约、提前生效被拒、生效日旧站拒新约、同日同向唯一防双线双占座**、过渡改站/改班/退订去重计费、生效落地新线/旧站停用、历史档案保留与新线独立结算））：
 
 ```bash
 BASE=http://host.docker.internal:3081/api node e2e-check.js

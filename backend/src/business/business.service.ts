@@ -226,15 +226,26 @@ export class BusinessService {
     if (!station || station.lineId !== sched.lineId)
       throw new BadRequestException('站点与线路不匹配');
     if (station.status === 'closed') throw new BadRequestException('该站点已关闭，请选择邻近站点');
-    // 搬迁冻结：原线路已有进行中的重排单时，停止接受新预约（过渡期内已预约不受影响）
-    const frozen = await this.ds.getRepository(LineRelocation).findOne({
+
+    // ===== 企业搬迁：按 effectDate 分离冻结/切换/停用，防止双线双约 =====
+    const line = await this.lines.findOne({ where: { id: sched.lineId } });
+    // 新厂区专线：openedFrom 之前不得预约
+    if (line?.openedFrom && dto.date < line.openedFrom)
+      throw new BadRequestException(`该新线路自 ${line.openedFrom} 起开放预约，生效日前不可提前预约`);
+    // 旧线路：进行中重排（未生效）冻结新预约；生效日后旧站停用
+    const rlo = await this.ds.getRepository(LineRelocation).findOne({
       where: { oldLineId: sched.lineId, bookingFrozen: true },
     });
-    if (frozen && !['cancelled', 'effective'].includes(frozen.status))
-      throw new BadRequestException(`该线路因企业搬迁正在重排（${frozen.rlNo}），新预约已冻结，请在生效后改约新线路或联系调度`);
-    // 站点已设搬迁停用日期
+    if (rlo && rlo.status !== 'cancelled') {
+      if (rlo.status !== 'effective')
+        throw new BadRequestException(`该线路因企业搬迁正在重排（${rlo.rlNo}），新预约已冻结，请在生效日 ${rlo.effectDate} 后改约新线路`);
+      if (dto.date >= rlo.effectDate)
+        throw new BadRequestException(`旧线路已于 ${rlo.effectDate} 停用，请预约新厂区专线`);
+    }
+    // 站点搬迁停用日期
     if (station.closedFrom && dto.date >= station.closedFrom)
       throw new BadRequestException(`站点「${station.name}」将于 ${station.closedFrom} 随旧线路停用，请选择新线路站点`);
+
     const holiday = await this.holidays.findOne({ where: { date: dto.date, type: 'suspended' } });
     if (holiday) throw new BadRequestException(`${dto.date} 因${holiday.name}停运，无法预约`);
 
@@ -242,6 +253,19 @@ export class BusinessService {
       where: { date: dto.date, employeeId: user.userId, scheduleId: dto.scheduleId },
     });
     if (dup && dup.status !== 'cancelled') throw new BadRequestException('该班次已预约，请勿重复提交');
+
+    // 同一员工同日同方向跨线唯一（旧线/新厂区专线不可重复占座）；
+    // 仅拦截“待乘”状态，已实际乘车完成（boarded/late/changed/no_show）的历史行程不算冲突
+    const pendingSameDay = await this.reservations.find({
+      where: { date: dto.date, employeeId: user.userId, status: In(['booked', 'on_manifest']) },
+    });
+    if (pendingSameDay.length) {
+      const schedIds = [...new Set(pendingSameDay.map(r => r.scheduleId))];
+      const others = await this.schedules.find({ where: { id: In(schedIds) } });
+      const clash = others.find(s => s.direction === sched.direction && s.id !== sched.id);
+      if (clash)
+        throw new BadRequestException(`您当日已有待乘的同方向班次（${clash.name}），同一员工同日同方向仅可保留一条有效预约，请先改班或退订`);
+    }
 
     const stationCount = await this.reservations.count({
       where: { date: dto.date, scheduleId: dto.scheduleId, stationId: dto.stationId,
