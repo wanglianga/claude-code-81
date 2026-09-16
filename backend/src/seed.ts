@@ -289,6 +289,49 @@ async function main() {
     companyConfirmations: [], employeeConfirmations: [],
   }));
 
+  // ---------- 昨日西线真实事故晚点车次（GPS 晚点25分/已签到/有事故留痕，尚未生成证明，供出证验收） ----------
+  const westAccEmps = [emps[1], emps[2], emps[4]]; // 徐静、王敏（华星）；钱多多（瑞丰）
+  const westTrip: any = await tripRepo.save(tripRepo.create({
+    date: yesterday, scheduleId: sWestMorning.id, vehicleId: v2.id, driverId: d2.id,
+    status: 'arrived', plannedDepart: '07:25',
+    actualDepart: new Date(`${yesterday}T07:30:00Z`),
+    actualArrive: new Date(`${yesterday}T08:35:00Z`),
+    delayMinutes: 25, boardedCount: 3, noShowCount: 0, emptySeats: 42,
+    qrToken: crypto.randomBytes(8).toString('hex'),
+    feeSplit: [
+      { companyId: c1.id, companyName: c1.name, passengers: 2, fee: 30 },
+      { companyId: c2.id, companyName: c2.name, passengers: 1, fee: 15 },
+    ],
+  }));
+  const westPlannedArrive = new Date(`${yesterday}T08:10:00Z`);
+  const westStationIds = [westStations[0].id, westStations[1].id, westStations[2].id];
+  for (let i = 0; i < westAccEmps.length; i++) {
+    const e = westAccEmps[i];
+    await rRepo.save(rRepo.create({
+      date: yesterday, employeeId: e.id, companyId: e.companyId,
+      scheduleId: sWestMorning.id, stationId: westStationIds[i], tripId: westTrip.id,
+      status: 'boarded', seatNo: i + 1, boardedAt: new Date(`${yesterday}T07:${26 + i * 2}:00Z`),
+    }));
+    await aRepo.save(aRepo.create({
+      date: yesterday, employeeId: e.id, companyId: e.companyId, tripId: westTrip.id,
+      scheduledArrive: westPlannedArrive, actualArrive: westTrip.actualArrive,
+      lateMinutes: 25, status: 'late', lateReason: 'congestion', exempt: false,
+      makeupFee: e.companyId === c2.id ? 30 : 20,
+      feeReason: '西线班车因道路事故晚点25分钟，超企业宽限',
+    }));
+  }
+  // 可追溯外部事件：同车次道路事故留痕（司机上报）
+  await ds.getRepository(E.TripEvent).save(ds.getRepository(E.TripEvent).create({
+    tripId: westTrip.id, type: 'accident', severity: 'critical',
+    description: '高新大道转软件园匝道发生两车追尾事故，临时管制，西线早班晚点约25分钟',
+    createdById: d2.id, createdByRole: 'driver', status: 'open', affectedCount: 3,
+    compensationType: 'none',
+  }));
+  await ds.getRepository(E.DriverPerformance).save(ds.getRepository(E.DriverPerformance).create({
+    driverId: d2.id, tripId: westTrip.id, date: yesterday,
+    safetyScore: 75, bonus: 0, penalty: 0, note: '晚点25分钟（道路事故，待证明核验）',
+  }));
+
   console.log('Seed finished. Accounts (password: Pass1234):');
   console.log('  admin / operator / dispatcher');
   console.log('  hr_huaxing / hr_ruifeng / hr_hengxin');

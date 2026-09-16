@@ -60,6 +60,8 @@
     <el-dialog v-model="genDlg" title="平台取证：生成晚点考勤豁免证明" width="640px">
       <el-alert type="info" :closable="false" style="margin-bottom:12px"
         title="平台将汇总 GPS 到厂/离场时间、站点扫码签到、到厂时间与各企业考勤规则自动取证；生成后推送涉事企业 HR 批量确认。"/>
+      <el-alert type="warning" :closable="false" style="margin-bottom:12px"
+        title="出证硬条件：GPS 实际到厂晚点达到平台阈值(10分钟)或某企业宽限规则，且该车次已有可追溯的外部事件（事故/拥堵/天气/施工/管制/故障）。准点/提前到厂或仅凭手工说明将被拒绝，且不会产生任何考勤、费用、绩效、复盘变更。"/>
       <el-form label-width="110px">
         <el-form-item label="晚点车次">
           <div style="display:flex;gap:8px;width:100%">

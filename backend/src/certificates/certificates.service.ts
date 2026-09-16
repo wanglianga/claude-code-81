@@ -20,6 +20,10 @@ export const CERT_REASONS: Record<string, string> = {
 
 // 非司机责任的外部原因：HR 确认后撤销晚点对司机绩效的扣分
 const NON_DRIVER_RESPONSIBLE = ['accident', 'congestion', 'weather', 'construction', 'other'];
+// 可追溯的外部晚点原因（必须能关联到同车次、留痕的途中事件）
+const EXTERNAL_CAUSE_TYPES = ['accident', 'congestion', 'weather', 'construction', 'detour', 'breakdown'];
+// 平台晚点取证阈值（分钟）：实际到厂晚点达到该值，或超过任一受影响企业宽限规则，才允许出证
+const PLATFORM_DELAY_MINUTES = 10;
 // 车上视为"受影响"的签到状态
 const ONBOARD = ['boarded', 'late', 'changed'];
 const hhmm = (d?: Date | string | null) =>
@@ -75,47 +79,67 @@ export class CertificateService {
       const vehicle = trip.vehicleId
         ? await manager.getRepository(Vehicle).findOne({ where: { id: trip.vehicleId } }) : null;
 
-      // 证据一：途中事件（事故上报）
+      // 证据一：可追溯外部事件（必须属于同一趟车，且为外部原因类型）
       let ev = dto.eventId
         ? await manager.getRepository(TripEvent).findOne({ where: { id: Number(dto.eventId) } })
         : null;
       if (!ev) {
+        // 自动选取同车次最近一条外部原因事件，不接受纯手工、无留痕的原因描述
         ev = await manager.getRepository(TripEvent).findOne({
-          where: { tripId: trip.id }, order: { id: 'DESC' },
+          where: { tripId: trip.id, type: In(EXTERNAL_CAUSE_TYPES) }, order: { id: 'DESC' },
         });
       }
-      if (ev && ev.tripId !== trip.id) throw new BadRequestException('事件与车次不匹配');
+      if (!ev)
+        throw new BadRequestException('未找到该趟车可追溯的外部事件（事故/拥堵/天气/施工/管制/故障），不能仅凭手工说明生成晚点证明');
+      if (ev.tripId !== trip.id)
+        throw new BadRequestException('所关联事件不属于该车次，证据链不可信');
+      if (!EXTERNAL_CAUSE_TYPES.includes(ev.type))
+        throw new BadRequestException(`事件类型「${ev.type}」不属于可豁免的外部晚点原因`);
 
-      // 证据二：GPS 到厂 / 发车时间
-      const delay = Math.max(0, trip.delayMinutes || 0);
+      // 证据二：GPS 可信到厂时间 —— 必须同时有实际到厂与计划到厂时间戳
+      if (!trip.actualArrive)
+        throw new BadRequestException('缺少 GPS 实际到厂时间，无法核验晚点');
       const plannedArrive = (await manager.getRepository(AttendanceRecord).findOne({
         where: { tripId: trip.id }, order: { id: 'ASC' },
       }))?.scheduledArrive
         || new Date((trip.actualDepart || new Date()).getTime() + 45 * 60000);
-      const incidentAt = dto.incidentAt ? new Date(dto.incidentAt)
-        : (trip.actualDepart ? new Date(trip.actualDepart.getTime() + 10 * 60000) : null);
-      const incidentLocation = dto.incidentLocation
-        || (ev?.description ? ev.description.slice(0, 20) : '事发路段');
+      // 以 GPS 实际到厂与计划到厂重新计算晚点，不信任手工填写的晚点分钟
+      const delay = Math.max(0, Math.round((trip.actualArrive.getTime() - plannedArrive.getTime()) / 60000));
 
-      // 统一晚点原因：一处生成，员工端 / HR 端共用
-      const reasonText = dto.reasonText?.trim()
-        || `${this.reasonName(reasonType)}${dto.incidentLocation ? `（${dto.incidentLocation}）` : ''}导致${line?.name || '班车'}晚到园区约 ${delay} 分钟`;
-
-      // 证据三：站点签到
+      // 证据三：已签到员工（GPS/扫码名单是受影响范围的唯一依据）
       const onboard = await manager.getRepository(Reservation).find({
         where: { tripId: trip.id, status: In(ONBOARD) }, order: { seatNo: 'ASC' },
       });
       if (!onboard.length) throw new BadRequestException('该车次没有签到乘客，无受影响员工');
-      const stationIds = [...new Set(onboard.flatMap(r => [r.stationId, r.boardedStationId].filter(Boolean)))] as number[];
-      const stations = stationIds.length
-        ? await manager.getRepository(Station).find({ where: { id: In(stationIds) } }) : [];
-      const employeeIds = [...new Set(onboard.map(r => r.employeeId))];
-      const empUsers = await manager.getRepository(User).find({ where: { id: In(employeeIds) } });
       const recs = await manager.getRepository(AttendanceRecord).find({ where: { tripId: trip.id } });
 
       // 证据四：企业考勤规则（按企业快照宽限/班次/扣款）
       const companyIds = [...new Set(onboard.map(r => r.companyId))];
       const companies = await manager.getRepository(Company).find({ where: { id: In(companyIds) } });
+
+      // ===== 统一核验闸门：实际晚点必须达到平台阈值或至少一家企业的宽限规则 =====
+      const overGraceCompanies = companies.filter(c => delay > c.lateGraceMinutes);
+      if (delay < PLATFORM_DELAY_MINUTES && overGraceCompanies.length === 0) {
+        throw new BadRequestException(
+          `GPS 核验该车次实际晚点 ${delay} 分钟（计划到厂 ${hhmm(plannedArrive)} / 实际到厂 ${hhmm(trip.actualArrive)}），`
+          + `未达到平台阈值 ${PLATFORM_DELAY_MINUTES} 分钟且不超过任一企业宽限规则，准点/提前到厂车次不得出具晚点豁免证明`,
+        );
+      }
+
+      // 校验通过后才允许固化晚点原因与事发信息（员工端 / HR 端共用同一份）
+      const incidentAt = dto.incidentAt ? new Date(dto.incidentAt)
+        : (trip.actualDepart ? new Date(trip.actualDepart.getTime() + 10 * 60000) : null);
+      const incidentLocation = dto.incidentLocation
+        || (ev.description ? ev.description.slice(0, 20) : '事发路段');
+      const reasonText = dto.reasonText?.trim()
+        || `${this.reasonName(reasonType)}${incidentLocation ? `（${incidentLocation}）` : ''}导致${line?.name || '班车'}晚到园区约 ${delay} 分钟`;
+
+      const stationIds = [...new Set(onboard.flatMap(r => [r.stationId, r.boardedStationId].filter(Boolean)))] as number[];
+      const stations = stationIds.length
+        ? await manager.getRepository(Station).find({ where: { id: In(stationIds) } }) : [];
+      const employeeIds = [...new Set(onboard.map(r => r.employeeId))];
+      const empUsers = await manager.getRepository(User).find({ where: { id: In(employeeIds) } });
+
       const rules = companies.map(c => {
         const rs = onboard.filter(r => r.companyId === c.id);
         const rr = recs.filter(x => x.companyId === c.id);
@@ -235,24 +259,22 @@ export class CertificateService {
     });
   }
 
-  // 到厂自动触发：晚点达到阈值且存在外部责任事件时平台自动生成
+  // 到厂自动触发：存在外部事件时尝试取证；是否晚点/是否达阈值由 generate() 统一核验，不满足则不出证
   async maybeAutoGenerate(tripId: number): Promise<LateCertificate | null> {
     try {
       const trip = await this.trips.findOne({ where: { id: tripId } });
-      if (!trip || trip.status !== 'arrived' || (trip.delayMinutes || 0) < 10) return null;
-      const existed = await this.certs.findOne({ where: { tripId } });
-      if (existed) return null;
-      const evs = await this.events.find({ where: { tripId }, order: { id: 'DESC' } });
-      const ev = evs.find(e => ['accident', 'congestion', 'weather', 'construction', 'detour', 'breakdown'].includes(e.type));
+      if (!trip || trip.status !== 'arrived' || !trip.actualArrive) return null;
+      if (await this.certs.findOne({ where: { tripId } })) return null;
+      const ev = await this.events.findOne({
+        where: { tripId, type: In(EXTERNAL_CAUSE_TYPES) }, order: { id: 'DESC' },
+      });
       if (!ev) return null;
       const reasonType = ev.type === 'late_arrival' ? 'congestion' : ev.type;
       const systemUser = { userId: ev.createdById, role: ev.createdByRole || 'dispatcher' };
-      return await this.generate({
-        tripId, eventId: ev.id, reasonType,
-        incidentLocation: ev.description.slice(0, 20),
-      }, systemUser);
+      // generate 内部核验失败（准点/提前、无签到等）直接抛错，自动触发静默放弃且零写入
+      return await this.generate({ tripId, eventId: ev.id, reasonType }, systemUser);
     } catch {
-      return null; // 自动生成不阻断到厂主流程
+      return null;
     }
   }
 
