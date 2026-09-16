@@ -136,8 +136,8 @@ http://<宿主IP>:<CC_PUBLISH_PORT>/           # 例如 http://localhost:3081/
 
 | 需求 | 实现位置 |
 |---|---|
-| 推荐临时站点、步行距离与通知范围 | `GET /api/relocations/recommend` 按同线路站序就近推荐（步行米数、安全上车点、步行路线、推荐分）；`POST /api/relocations` 按日期+班次+原站点圈定受影响预约并逐人通知 |
-| 员工确认后司机导航、乘车名单、未确认提醒同步 | 员工在「班车预约」页确认 `POST /api/relocations/:id/confirm`，名单上车站点改为临停点（原站存 `originalStationId`）；`GET /api/driver/trips/:id/navigation` 向司机返回临停点、安全点、步行路线、每人应接站点与 `unconfirmedCount` |
+| 推荐临时站点、步行距离与通知范围 | `GET /api/relocations/recommend` 按同线路站序就近推荐；**候选/手工创建/员工确认共用同一可停靠判定（仅 `normal`）**，施工/关闭站 `dockable=false` 不可选；带日期+班次时返回实时剩余容量（步行米数、安全上车点、步行路线、推荐分）。`POST /api/relocations` 在事务内**行锁目标临停站点**，按同日期/班次既有预约 + 进行中改站迁入名额重算剩余容量，容量不足默认整体 4xx 拒绝（零确认单/零通知/零名单变更），勾选 `allowPartial` 才只对不超过剩余容量的前 N 人分流 |
+| 员工确认后司机导航、乘车名单、未确认提醒同步且**不超容量** | 员工 `POST /api/relocations/:id/confirm` 在事务内**再次锁定临停站点并重算容量**，满员则拒绝迁入（不写名单/导航/通知）；通过后名单上车站点改为临停点（原站存 `originalStationId`，显式列更新避免 eager 覆盖）；`GET /api/driver/trips/:id/navigation` 向司机返回临停点、安全点、步行路线、每人应接站点与 `unconfirmedCount` |
 | 临时站点显示安全上车点和步行路线 | 员工确认卡片、司机导航、调度点名表统一展示 `safePickupPoint/walkMeters/walkRoute` |
 | 未确认员工进入司机点名，防止改站漏接 | `POST /api/driver/trips/:id/roll-call` 支持 `on_board/no_show/refused_change/absent/resolved`，保留**未上车原因、站点时间、员工确认状态**，回写预约并通知员工 |
 
@@ -215,7 +215,7 @@ cd frontend && npm install && npx vite   # 已配置 /api 代理到 localhost:30
 
 验证方式以「宿主 `docker compose up -d` 健康检查通过 + 浏览器走通上述业务流」为准。
 
-仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 160 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、完整双确认矩阵、**Promise.all 并发 6 路确认与两个 operator 并发发布互斥**、访客门禁、停运通知，**晚点考勤豁免证明全链路**（出证可信核验、事故/个人迟到分责、跨企业批量回写、绩效/复盘/同源原因），**站点施工临时改站**（临停推荐、员工确认后名单/导航同步、未确认人员司机点名留痕防漏接），以及**企业加班补车**（车辆/司机工时 300 分钟上限与强制休息双重校验、休息期连续派单拦截、费用按企业/人数/工时拆分、员工乘车记录与企业账单进入月度结算、超时驾驶调度提醒））：
+仓库另附 `e2e-check.js`（Node 内置模块，无需安装依赖），在 compose 启动后对 `http://host.docker.internal:<CC_PUBLISH_PORT>` 跑 174 项接口级业务断言（覆盖六角色鉴权、名单、签到、改站、代刷、事件五方协同、考勤豁免、申诉、完整双确认矩阵、**Promise.all 并发 6 路确认与两个 operator 并发发布互斥**、访客门禁、停运通知，**晚点考勤豁免证明全链路**（出证可信核验、事故/个人迟到分责、跨企业批量回写、绩效/复盘/同源原因），**站点施工临时改站**（临停推荐统一仅 normal 可停靠且带实时剩余容量、施工站创建 4xx 零副作用、容量 3 承接 4 人时默认整体拒绝/可选按容量分流且不超 3 人、员工确认二次容量校验、未确认人员司机点名留痕防漏接），以及**企业加班补车**（车辆/司机工时 300 分钟上限与强制休息双重校验、休息期连续派单拦截、费用按企业/人数/工时拆分、员工乘车记录与企业账单进入月度结算、超时驾驶调度提醒））：
 
 ```bash
 BASE=http://host.docker.internal:3081/api node e2e-check.js

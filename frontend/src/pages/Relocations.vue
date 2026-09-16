@@ -56,7 +56,7 @@
     <el-dialog v-model="createDlg" title="站点施工 · 推荐临时站点并通知" width="720px">
       <el-form label-width="100px">
         <el-form-item label="日期">
-          <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD"/>
+          <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" @change="loadRecommend"/>
         </el-form-item>
         <el-form-item label="线路">
           <el-select v-model="form.lineId" style="width:100%" @change="form.originalStationId=null;form.scheduleId=null">
@@ -64,7 +64,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="影响班次">
-          <el-select v-model="form.scheduleId" clearable placeholder="空=当天该线全部班次" style="width:100%">
+          <el-select v-model="form.scheduleId" clearable placeholder="空=当天该线全部班次" style="width:100%" @change="loadRecommend">
             <el-option v-for="s in lineSchedules" :key="s.id" :label="`${s.name} ${s.departureTime}`" :value="s.id"/>
           </el-select>
         </el-form-item>
@@ -76,20 +76,34 @@
         </el-form-item>
         <el-form-item label="推荐临停点">
           <el-table v-if="recs.length" :data="recs" size="small" border highlight-current-row
-                    @current-change="(r:any)=>r&&(form.temporaryStationId=r.temporaryStationId)">
+                    :row-class-name="reloRowClass"
+                    @current-change="(r:any)=>r&&r.dockable&&r.remainingCapacity!==0&&(form.temporaryStationId=r.temporaryStationId)">
             <el-table-column label="选择" width="55">
               <template #default="{row}">
-                <el-radio v-model="form.temporaryStationId" :value="row.temporaryStationId">&nbsp;</el-radio>
+                <el-radio v-model="form.temporaryStationId" :value="row.temporaryStationId"
+                          :disabled="!row.dockable || row.remainingCapacity===0">&nbsp;</el-radio>
               </template>
             </el-table-column>
             <el-table-column prop="name" label="临时站点" width="110"/>
             <el-table-column label="步行距离" width="90">
               <template #default="{row}">约 {{ row.walkMeters }} 米</template>
             </el-table-column>
-            <el-table-column prop="safePickupPoint" label="安全上车点" min-width="180" show-overflow-tooltip/>
-            <el-table-column prop="walkRoute" label="步行路线" min-width="220" show-overflow-tooltip/>
+            <el-table-column label="容量/剩余" width="90">
+              <template #default="{row}">
+                <el-tag size="small" :type="row.remainingCapacity===null?'info':row.remainingCapacity>0?'success':'danger'">
+                  {{ row.capacity }}/{{ row.remainingCapacity===null?'—':row.remainingCapacity }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="statusNote" label="可停靠判定" width="170" show-overflow-tooltip/>
+            <el-table-column prop="safePickupPoint" label="安全上车点" min-width="160" show-overflow-tooltip/>
+            <el-table-column prop="walkRoute" label="步行路线" min-width="200" show-overflow-tooltip/>
           </el-table>
           <el-empty v-else description="选择无法停靠站点后自动推荐" :image-size="50"/>
+        </el-form-item>
+        <el-form-item label="容量分流">
+          <el-switch v-model="form.allowPartial"/>
+          <span class="muted" style="margin-left:8px">容量不足时仅为前 N 名员工（不超剩余容量）生成确认，其余保留原方案另行通知；关闭则容量不足整体拒绝</span>
         </el-form-item>
         <el-form-item label="施工原因">
           <el-input v-model="form.reason" placeholder="如：市政道路施工，站点港湾封闭至当日12时"/>
@@ -151,11 +165,16 @@ const lines = ref<any[]>([]);
 const createDlg = ref(false);
 const detailDlg = ref(false);
 const detail = ref<any>({});
-const form = ref<any>({ date: new Date().toISOString().slice(0, 10), lineId: null, scheduleId: null, originalStationId: null, temporaryStationId: null, reason: '' });
+const form = ref<any>({ date: new Date().toISOString().slice(0, 10), lineId: null, scheduleId: null, originalStationId: null, temporaryStationId: null, reason: '', allowPartial: false });
 const recs = ref<any[]>([]);
 
 const lineStations = computed(() => lines.value.find((l: any) => l.id === form.value.lineId)?.stationList || []);
 const lineSchedules = ref<any[]>([]);
+
+function reloRowClass({ row }: any) {
+  if (!row.dockable || row.remainingCapacity === 0) return 'row-undockable';
+  return '';
+}
 
 function rollName(r: string) {
   return ({ on_board: '临停点已上车', no_show: '未到', refused_change: '拒改站未乘', absent: '缺席', resolved: '已处理' } as any)[r] || r;
@@ -171,15 +190,19 @@ async function load() {
   lineSchedules.value = ss;
 }
 async function openCreate() {
-  form.value = { date: new Date().toISOString().slice(0, 10), lineId: lines.value[0]?.id, scheduleId: null, originalStationId: null, temporaryStationId: null, reason: '道路施工，原站点无法停靠' };
+  form.value = { date: new Date().toISOString().slice(0, 10), lineId: lines.value[0]?.id, scheduleId: null, originalStationId: null, temporaryStationId: null, reason: '道路施工，原站点无法停靠', allowPartial: false };
   recs.value = [];
   createDlg.value = true;
 }
 async function loadRecommend() {
   recs.value = [];
+  form.value.temporaryStationId = null;
   if (!form.value.lineId || !form.value.originalStationId) return;
   const { data } = await api.get('/relocations/recommend', {
-    params: { lineId: form.value.lineId, stationId: form.value.originalStationId },
+    params: {
+      lineId: form.value.lineId, stationId: form.value.originalStationId,
+      date: form.value.date, scheduleId: form.value.scheduleId || undefined,
+    },
   });
   recs.value = data;
 }
@@ -202,3 +225,7 @@ async function finish(row: any) {
 }
 onMounted(load);
 </script>
+
+<style scoped>
+:deep(.row-undockable) { background: #fef0f0; color: #c0c4cc; }
+</style>

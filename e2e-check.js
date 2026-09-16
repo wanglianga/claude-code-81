@@ -611,15 +611,87 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
     && /未确认改站/.test(dec2.json.confirmations.find(c => c.employeeId === idLi).reservation.changeNote || ''),
     dec2.json.confirmations);
 
+  // 15e. 施工临停站禁止创建改站 + 容量上限（独立使用“后天”避免污染明日导航流程）
+  const dayAfter = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
+  const bvDay3 = (await req('GET', `/booking-view?date=${dayAfter}`, null, tEmp2)).json;
+  const morning3 = bvDay3.find(s => s.name === '东线早班');
+  const s3Binhe = morning3.stations.find(s => s.name === '滨河家园');
+  const s3Donghu = morning3.stations.find(s => s.name === '东湖路口'); // 容量 3
+  const s3Keji = morning3.stations.find(s => s.name === '科技大桥');
+
+  // 4 名员工后天在滨河家园预约
+  const capTokens = [await login('emp_xu'), await login('emp_wang'), await login('emp_zhou'), await login('emp_wu')];
+  for (const tk of capTokens) {
+    const bk = await req('POST', '/reservations', { date: dayAfter, scheduleId: morning.id, stationId: s3Binhe.id }, tk);
+    check('后天容量测试预约成功', ok(bk), bk.json);
+  }
+
+  // 把科技大桥标为施工，尝试以它为临停点 → 4xx 且零副作用
+  const markCon = await req('POST', `/stations/${s3Keji.id}`, { status: 'construction', note: 'E2E 临停点施工' }, tDis);
+  check('临停站标记为施工', ok(markCon) && markCon.json.status === 'construction', markCon.json);
+  const conRelosBefore = (await req('GET', '/relocations', null, tDis)).json.length;
+  const badCreate = await req('POST', '/relocations', {
+    date: dayAfter, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: s3Binhe.id, temporaryStationId: s3Keji.id, reason: 'E2E 不应成功',
+  }, tDis);
+  check('施工状态站点不能作为临停点创建改站(4xx)', badCreate.status >= 400 && /不可停靠|施工/.test(JSON.stringify(badCreate.json)), badCreate.json);
+  const conRelosAfter = (await req('GET', '/relocations', null, tDis)).json;
+  check('拒绝后无确认单/改站单产生', conRelosAfter.length === conRelosBefore, { before: conRelosBefore, after: conRelosAfter.length });
+  const myRelosXuCap = (await req('GET', '/my/relocations', null, capTokens[0])).json;
+  check('拒绝后员工无新增改站通知/确认', !myRelosXuCap.some(r => /不应成功/.test(r.relocation.reason)), myRelosXuCap.length);
+  // 推荐接口对施工站标记不可停靠
+  const recCon = (await req('GET', `/relocations/recommend?lineId=${morning.lineId}&stationId=${s3Binhe.id}&date=${dayAfter}&scheduleId=${morning.id}`, null, tDis)).json;
+  const kejiRec = recCon.find(r => r.temporaryStationId === s3Keji.id);
+  const donghuRec = recCon.find(r => r.temporaryStationId === s3Donghu.id);
+  check('推荐：施工站 dockable=false，正常站 dockable=true 且返回剩余容量',
+    kejiRec.dockable === false && donghuRec.dockable === true && donghuRec.remainingCapacity === 3, kejiRec);
+
+  // 容量不足：4 人整体分流到容量3的东湖路口 → 默认整体拒绝
+  const fullCreate = await req('POST', '/relocations', {
+    date: dayAfter, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: s3Binhe.id, temporaryStationId: s3Donghu.id, reason: '滨河施工（E2E 满载拒绝）',
+  }, tDis);
+  check('容量不足时整体改站被拒（4人 > 东湖路口容量3）',
+    fullCreate.status >= 400 && /容量/.test(JSON.stringify(fullCreate.json)), fullCreate.json);
+  check('整体拒绝不产生改站单',
+    !(await req('GET', '/relocations', null, tDis)).json.some(r => /满载拒绝/.test(r.reason || '')));
+
+  // 开启 allowPartial：仅前 3 人生成确认，不出现 4 人同迁
+  const partialCreate = await req('POST', '/relocations', {
+    date: dayAfter, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: s3Binhe.id, temporaryStationId: s3Donghu.id,
+    reason: '滨河施工（E2E 分流）', allowPartial: true,
+  }, tDis);
+  check('容量分流：仅为不超过容量的 3 人生成确认',
+    ok(partialCreate) && partialCreate.json.affectedCount === 3
+    && partialCreate.json.confirmations.length === 3, partialCreate.json);
+  check('分流建单但未确认人员站点仍在原站',
+    partialCreate.json.confirmations.every(c => c.reservation.stationId === s3Binhe.id),
+    partialCreate.json.confirmations.map(c => c.reservation.stationId));
+
+  // 第 4 人无法在已满的东湖路口确认（3 个 pending 名额已占满）→ 员工确认容量校验
+  const leftoverEmp = capTokens[3];
+  // 先给第4人也建一张指向东湖路口的改站（模拟另一调度尝试），整体应被容量拦截
+  const secondRelo = await req('POST', '/relocations', {
+    date: dayAfter, scheduleId: morning.id, lineId: morning.lineId,
+    originalStationId: s3Binhe.id, temporaryStationId: s3Donghu.id, reason: 'E2E 第二批',
+  }, tDis);
+  check('东湖路口名额被前一批占满后，第二批整体改站被拒',
+    secondRelo.status >= 400 && /容量/.test(JSON.stringify(secondRelo.json)), secondRelo.json);
+  void leftoverEmp;
+
+  // 恢复科技大桥正常
+  await req('POST', `/stations/${s3Keji.id}`, { status: 'normal' }, tDis);
+
   // 15d. 司机导航联动 + 点名留痕：为明日生成新车次，再对其改站
   const navBefore = (await req('GET', `/driver/trips/${tripId}/navigation`, null, tDrv)).json;
   check('无改站时司机导航正常', navBefore.tripId === tripId && Array.isArray(navBefore.temporaryStops), navBefore);
 
-  const stBinhe = morningTom.stations.find(s => s.name === '滨河家园');
-  const stDonghu2 = morningTom.stations.find(s => s.name === '东湖路口');
-  const tEmpSun = await login('emp_sun');
-  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe.id }, tEmpSun);
-  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe.id }, tEmpZhou);
+  const stBinhe2 = morningTom.stations.find(s => s.name === '滨河家园');
+  const stDonghu3 = morningTom.stations.find(s => s.name === '东湖路口');
+  const tEmpSun2 = await login('emp_sun');
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe2.id }, tEmpSun2);
+  await req('POST', '/reservations', { date: tomorrow, scheduleId: morning.id, stationId: stBinhe2.id }, tEmpZhou);
   const genTom = await req('POST', '/trips/generate', {
     date: tomorrow, scheduleId: morning.id, driverId: drvInfo.find(d => d.username === 'driver02').id,
   }, tDis);
@@ -632,7 +704,7 @@ const login = async (u) => (await req('POST', '/auth/login', { username: u, pass
 
   const reloToday = await req('POST', '/relocations', {
     date: tomorrow, scheduleId: morning.id, lineId: morning.lineId,
-    originalStationId: stBinhe.id, temporaryStationId: stDonghu2.id,
+    originalStationId: stBinhe2.id, temporaryStationId: stDonghu3.id,
     reason: '滨河家园路口施工（E2E 导航联动）',
   }, tDis);
   check('明日车次改站发起（影响新车次2人）', ok(reloToday) && reloToday.json.affectedCount === 2, reloToday.json);

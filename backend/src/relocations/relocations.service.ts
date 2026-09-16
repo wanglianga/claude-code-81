@@ -7,6 +7,8 @@ import {
 } from '../entities';
 
 const AFFECTED_RES = ['booked', 'on_manifest'];
+// 计算容量时视为占用候车名额的预约状态（已取消/未到不占）
+const OCCUPYING_RES = ['booked', 'on_manifest', 'boarded', 'late', 'changed'];
 
 @Injectable()
 export class RelocationService {
@@ -27,26 +29,84 @@ export class RelocationService {
     await this.notifications.save(this.notifications.create({ userId, title, content, category }));
   }
 
-  // 临停推荐：同线路其它站点，按线路顺序就近估算步行距离，并给出安全上车点/步行路线
-  async recommend(lineId: number, stationId: number) {
+  // 统一的临停可停靠判定：仅 normal 站点可作为临停（施工/关闭等一律不可）
+  private isDockable(s: Station) {
+    return s.status === 'normal';
+  }
+
+  // 同日期 + 班次集合下，目标临停站的候车占用数（既有预约 + 其它改站单已迁入/待迁入名额）
+  // managerOrDs 可为事务 EntityManager 或 DataSource（二者均有 getRepository）
+  private async stationOccupancy(
+    ctx: any, tempStationId: number, date: string, scheduleIds: number[],
+    excludeReservationIds: number[] = [],
+  ) {
+    // 1) 当前已在临停站的预约（含已 accept、stationId 已改到该站的改站）
+    const qb = ctx.getRepository(Reservation).createQueryBuilder('r')
+      .where('r.date = :date', { date })
+      .andWhere('r.scheduleId IN (:...sids)', { sids: scheduleIds })
+      .andWhere('r."stationId" = :sid', { sid: tempStationId })
+      .andWhere('r.status IN (:...st)', { st: OCCUPYING_RES });
+    if (excludeReservationIds.length)
+      qb.andWhere('r.id NOT IN (:...ex)', { ex: excludeReservationIds });
+    const atStation = await qb.getCount();
+
+    // 2) 其它进行中改站单指向该站、但其预约尚未迁到该站的确认名额（pending/accepted）
+    const relos = await ctx.getRepository(StationRelocation).find({
+      where: { date, temporaryStationId: tempStationId, status: In(['proposed', 'confirmed']) },
+    });
+    let pendingNotMoved = 0;
+    for (const r of relos) {
+      if (r.scheduleId && !scheduleIds.includes(r.scheduleId)) continue;
+      const confs = await ctx.getRepository(RelocationConfirmation).find({
+        where: { relocationId: r.id, status: In(['pending', 'accepted']) },
+      });
+      for (const c of confs) {
+        if (excludeReservationIds.includes(c.reservationId)) continue;
+        const res = await ctx.getRepository(Reservation).findOne({ where: { id: c.reservationId } });
+        if (res && res.stationId !== tempStationId) pendingNotMoved++;
+      }
+    }
+    return atStation + pendingNotMoved;
+  }
+
+  // 临停推荐：同线路仅 normal 站点；按站序就近，附步行距离/安全点/剩余容量（需结合日期班次）
+  async recommend(lineId: number, stationId: number, date?: string, scheduleId?: number) {
     const origin = await this.stations.findOne({ where: { id: stationId } });
     if (!origin) throw new NotFoundException('原站点不存在');
     const all = await this.stations.find({ where: { lineId }, order: { seq: 'ASC' } });
-    const usable = all.filter(s => s.id !== stationId && s.status !== 'closed');
-    return usable.map(s => {
+    let scheduleIds: number[] = [];
+    if (date && scheduleId) scheduleIds = [Number(scheduleId)];
+    else if (date) {
+      const ss = await this.schedules.find({ where: { lineId, valid: true } });
+      scheduleIds = ss.map(s => s.id);
+    }
+    const result: any[] = [];
+    for (const s of all) {
+      if (s.id === stationId) continue;
       const gap = Math.abs(s.seq - origin.seq);
-      const walkMeters = gap <= 1 ? 260 : gap * 320; // 相邻站约 260m，演示用确定性估算
-      return {
+      const walkMeters = gap <= 1 ? 260 : gap * 320;
+      const dockable = this.isDockable(s);
+      let remaining: number | null = null;
+      if (date && scheduleIds.length) {
+        const occ = await this.stationOccupancy(this.ds.manager, s.id, date, scheduleIds);
+        remaining = s.capacity - occ;
+      }      result.push({
         temporaryStationId: s.id,
         name: s.name,
         seq: s.seq,
         walkMeters,
+        capacity: s.capacity,
+        remainingCapacity: remaining,
         safePickupPoint: `${s.name}东门公交港湾（有照明、非机动车隔离）`,
         walkRoute: `由${origin.name}沿人行道步行约 ${walkMeters} 米至${s.name}，途经 2 处人行横道，均有信号灯`,
-        statusNote: s.status === 'construction' ? '该临停点也在施工，不推荐' : '可安全停靠',
-        recommendScore: 100 - gap * 20 - (s.status === 'construction' ? 60 : 0),
-      };
-    }).sort((a, b) => b.recommendScore - a.recommendScore);
+        dockable,
+        statusNote: !dockable
+          ? (s.status === 'construction' ? '该站点施工中，禁止作为临停点' : '该站点不可停靠')
+          : (remaining !== null && remaining <= 0 ? '该站点候车容量已满，不可分流' : '可安全停靠'),
+        recommendScore: (dockable ? 100 : 0) - gap * 20 - (remaining !== null && remaining <= 0 ? 80 : 0),
+      });
+    }
+    return result.sort((a, b) => b.recommendScore - a.recommendScore);
   }
 
   // 调度/运营发起临时改站
@@ -59,44 +119,73 @@ export class RelocationService {
     const temp = await this.stations.findOne({ where: { id: Number(dto.temporaryStationId) } });
     if (!temp || temp.lineId !== lineId) throw new BadRequestException('临时站点必须与原站点同线路');
     if (temp.id === origin.id) throw new BadRequestException('临时站点不能与原站点相同');
-    if (temp.status === 'closed') throw new BadRequestException('该临时站点已关闭，不可停靠');
+    // 统一可停靠判定：仅 normal；施工/关闭等一律拒绝（与推荐、员工确认同源）
+    if (!this.isDockable(temp))
+      throw new BadRequestException(`临时站点「${temp.name}」当前状态为${temp.status === 'construction' ? '施工' : temp.status}，不可停靠，无法下发安全上车指引`);
 
-    // 影响班次：指定班次或当天该线上行全部班次
+    // 影响班次：指定班次或当天该线全部班次
     let scheduleIds: number[] = dto.scheduleId ? [Number(dto.scheduleId)] : [];
     if (!scheduleIds.length) {
       const ss = await this.schedules.find({ where: { lineId, valid: true } });
       scheduleIds = ss.map(s => s.id);
     }
+    if (!scheduleIds.length) throw new BadRequestException('该线路当天没有可改站的班次');
 
     let reloId: number;
     await this.ds.transaction(async (manager) => {
+      // 行锁目标临停站点（串行化并发改站），锁后再读一次状态
+      const lockedTemp = await manager.getRepository(Station).findOne({
+        where: { id: temp.id }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!this.isDockable(lockedTemp))
+        throw new BadRequestException(`临时站点「${lockedTemp.name}」已不可停靠（${lockedTemp.status}），请改选其它临停点`);
+
+      // 读取受影响预约（同日期/班次/原站点、待乘车）；并发安全由上面的目标站点行锁保证，
+      // 不对 Reservation 加 FOR UPDATE（其 eager 关系会生成外连接，PG 不允许锁 nullable 侧）
       const affected = await manager.getRepository(Reservation).find({
         where: { date: dto.date, scheduleId: In(scheduleIds), stationId: origin.id, status: In(AFFECTED_RES) },
         order: { id: 'ASC' },
       });
-      // 已上车的乘客不再受影响（车已过站）
       const targets = affected.filter(r => AFFECTED_RES.includes(r.status));
       if (!targets.length) throw new BadRequestException('该站点/班次当前没有待乘车的受影响员工');
 
-      const gap = Math.abs(temp.seq - origin.seq);
+      // 容量：同日期/班次既有候车 + 进行中其它改站迁入名额
+      const occ = await this.stationOccupancy(manager, temp.id, dto.date, scheduleIds);
+      let remaining = lockedTemp.capacity - occ;
+      if (remaining < targets.length) {
+        if (dto.allowPartial) {
+          // 明确分流方案：只对不超过剩余容量的前 N 人生成改站确认，其余不分流
+          if (remaining <= 0)
+            throw new BadRequestException(`临时站点「${lockedTemp.name}」候车容量已满（${lockedTemp.capacity}人），请选择其它临停点或拆分分流`);
+        } else {
+          throw new BadRequestException(
+            `临时站点「${lockedTemp.name}」剩余候车容量仅 ${Math.max(0, remaining)} 人，无法承接本次 ${targets.length} 名员工；`
+            + `请选择其它临停点，或勾选“按容量分流（其余员工保留原方案/另行通知）”`,
+          );
+        }
+      }
+      const acceptedTargets = dto.allowPartial ? targets.slice(0, Math.max(0, remaining)) : targets;
+      remaining -= acceptedTargets.length;
+
+      const gap = Math.abs(lockedTemp.seq - origin.seq);
       const walkMeters = dto.walkMeters ?? (gap <= 1 ? 260 : gap * 320);
       const relo = await manager.getRepository(StationRelocation).save(
         manager.getRepository(StationRelocation).create({
           date: dto.date, scheduleId: dto.scheduleId ? Number(dto.scheduleId) : null,
-          originalStationId: origin.id, temporaryStationId: temp.id, lineId,
-          safePickupPoint: dto.safePickupPoint || `${temp.name}东门公交港湾（有照明、非机动车隔离）`,
+          originalStationId: origin.id, temporaryStationId: lockedTemp.id, lineId,
+          safePickupPoint: dto.safePickupPoint || `${lockedTemp.name}东门公交港湾（有照明、非机动车隔离）`,
           walkMeters,
           walkRoute: dto.walkRoute
-            || `由${origin.name}沿人行道步行约 ${walkMeters} 米至${temp.name}，途经人行横道（有信号灯）`,
+            || `由${origin.name}沿人行道步行约 ${walkMeters} 米至${lockedTemp.name}，途经人行横道（有信号灯）`,
           reason: dto.reason || '道路施工，原站点无法停靠',
-          affectedCount: targets.length, status: 'proposed',
+          affectedCount: acceptedTargets.length, status: 'proposed',
           createdById: user.userId, createdByRole: user.role,
         }),
       );
 
-      // 通知范围：受影响员工 + 当天该班次司机；逐人建立确认单
+      // 通知范围：被分流员工 + 当班车司机；逐人建立确认单（仅容量内员工）
       const driverIds = new Set<number>();
-      for (const r of targets) {
+      for (const r of acceptedTargets) {
         r.relocationId = relo.id;
         r.originalStationId = r.originalStationId ?? origin.id;
         await manager.getRepository(Reservation).save(r);
@@ -108,7 +197,7 @@ export class RelocationService {
         await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
           userId: r.employeeId, title: '临时改站通知（请确认）',
           content: `${dto.date} 您的乘车站点「${origin.name}」因${relo.reason}无法停靠，`
-            + `临时上车点改为「${temp.name}」，${relo.safePickupPoint}，步行约 ${walkMeters} 米。请尽快在 App 内确认，未确认将进入司机点名提醒。`,
+            + `临时上车点改为「${lockedTemp.name}」，${relo.safePickupPoint}，步行约 ${walkMeters} 米。请尽快在 App 内确认，未确认将进入司机点名提醒。`,
           category: 'critical',
         }));
         const trip = await manager.getRepository(Trip).findOne({
@@ -119,8 +208,8 @@ export class RelocationService {
       for (const did of driverIds) {
         await manager.getRepository(Notification).save(manager.getRepository(Notification).create({
           userId: did, title: '导航变更：临时改站',
-          content: `${origin.name} 施工无法停靠，改停 ${temp.name}（${relo.safePickupPoint}），`
-            + `导航与乘车名单已更新，共 ${targets.length} 名员工受影响，未确认员工请按点名表逐一核对防止漏接。`,
+          content: `${origin.name} 施工无法停靠，改停 ${lockedTemp.name}（${relo.safePickupPoint}），`
+            + `导航与乘车名单已更新，共 ${acceptedTargets.length} 名员工分流至该站（该站改站后剩余容量 ${remaining} 人），未确认员工请按点名表逐一核对防止漏接。`,
           category: 'critical',
         }));
       }
@@ -186,16 +275,32 @@ export class RelocationService {
       const temp = await manager.getRepository(Station).findOne({ where: { id: relo.temporaryStationId } });
       const origin = await manager.getRepository(Station).findOne({ where: { id: relo.originalStationId } });
       if (r) {
-        const note = dto.accept
-          ? `施工临停改站：${origin.name} → ${temp.name}（员工已确认，步行约${relo.walkMeters}米）`
-          : `员工未确认改站（${dto.note || '无法前往临停点'}），列入司机点名/分流`;
-        // 用显式列更新，避免 eager 的 station 关系对象覆盖外键
-        await manager.createQueryBuilder().update(Reservation)
-          .set(dto.accept
-            ? { originalStationId: r.originalStationId ?? origin.id, stationId: temp.id, changeNote: note }
-            : { changeNote: note })
-          .where('id = :id', { id: r.id })
-          .execute();
+        if (dto.accept) {
+          // 锁定临停站点并按同日期/班次重算容量，满员则拒绝迁入（不写名单/导航）
+          const lockedTemp = await manager.getRepository(Station).findOne({
+            where: { id: temp.id }, lock: { mode: 'pessimistic_write' },
+          });
+          if (!this.isDockable(lockedTemp))
+            throw new BadRequestException(`临时站点「${lockedTemp.name}」当前不可停靠（${lockedTemp.status}），无法确认改站，请联系调度分流`);
+          const scheduleIds = relo.scheduleId ? [relo.scheduleId]
+            : (await manager.getRepository(Schedule).find({ where: { lineId: relo.lineId, valid: true } })).map(s => s.id);
+          // 排除本人（其 pending 名额此前已计入，迁入后改由 atStation 计入，不重复占）
+          const occ = await this.stationOccupancy(manager, lockedTemp.id, relo.date, scheduleIds, [r.id]);
+          if (lockedTemp.capacity - occ <= 0)
+            throw new BadRequestException(`临时站点「${lockedTemp.name}」候车容量已满（${lockedTemp.capacity}人），请改选其它临停点或由调度拆分分流`);
+          const note = `施工临停改站：${origin.name} → ${lockedTemp.name}（员工已确认，步行约${relo.walkMeters}米）`;
+          // 用显式列更新，避免 eager 的 station 关系对象覆盖外键
+          await manager.createQueryBuilder().update(Reservation)
+            .set({ originalStationId: r.originalStationId ?? origin.id, stationId: lockedTemp.id, changeNote: note })
+            .where('id = :id', { id: r.id })
+            .execute();
+        } else {
+          const note = `员工未确认改站（${dto.note || '无法前往临停点'}），列入司机点名/分流`;
+          await manager.createQueryBuilder().update(Reservation)
+            .set({ changeNote: note })
+            .where('id = :id', { id: r.id })
+            .execute();
+        }
       }
 
       // 通知调度与司机确认进度
